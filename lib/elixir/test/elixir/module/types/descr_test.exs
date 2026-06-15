@@ -1258,6 +1258,9 @@ defmodule Module.Types.DescrTest do
       assert fun_apply(opt_union(integer(), none_fun(1)), [integer()]) == :badfun
       assert fun_apply(opt_union(integer(), fun([integer()], atom())), [integer()]) == :badfun
       assert fun_apply(opt_union(integer(), dynamic()), [integer()]) == :badfun
+
+      assert fun_apply(none(), [integer()]) == :badfun
+      assert fun_apply(dynamic(none()), [integer()]) == :badfun
     end
 
     test "static" do
