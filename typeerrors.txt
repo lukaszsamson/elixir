@@ -1,0 +1,200 @@
+Elixir typesystem — exploratory findings (revised)
+====================================================
+
+Build: 1.20.0-rc.5 (bf47be5), Erlang/OTP 28.
+
+RETRACTION
+----------
+A previous version of this file claimed two "unsound narrowing" bugs based
+on examples like:
+
+    case 1 do
+      1 -> x = :rebound_atom; x
+      _ -> :other
+    end
+    x + 1
+
+These claims were wrong. In modern Elixir, variables assigned inside a
+`case`/`cond`/`if` clause body do NOT leak to the enclosing scope. The
+outer `x` is unchanged after the construct unless an explicit
+`x = <construct>` binds the result. Verified at runtime:
+
+    iex> x = 5; case 1 do 1 -> x = :rebound; x; _ -> nil end; x
+    5
+
+The typechecker is correct to preserve the outer guard's narrowing of
+`x` across the construct — there is no rebinding to track. The warnings I
+mistakenly read as "false positives" are correct diagnostics: e.g.
+`Atom.to_string(x)` after the case really does receive `x : integer()`,
+and really does fail at runtime. I have no soundness or narrowing bug
+to report under that hypothesis.
+
+The two non-narrowing claims (3 and 4 below) survive and are reproducible.
+Claims 5 and 6 are noted as type widening (false negatives) only, per the
+task scope.
+
+
+================================================================================
+CLAIM A (was 3) — INCONSISTENT BOUNDS CHECK: `put_elem` /
+`:erlang.setelement` does NOT type-check the index against the tuple
+shape, while `elem`, `Tuple.insert_at`, and `Tuple.delete_at` do.
+================================================================================
+
+Repro:
+
+    defmodule Tup do
+      def a, do: elem({1, 2}, 5)               # Elixir warns + Erlang warns
+      def b, do: put_elem({1, 2}, 5, :x)       # Only Erlang warns; Elixir is silent
+      def c, do: Tuple.insert_at({1, 2}, 5, :x)# Elixir warns
+      def d, do: Tuple.delete_at({1, 2}, 5)    # Elixir warns
+    end
+
+Output from `bin/elixirc Tup`:
+
+    warning: the call to setelement/3 will fail with a 'badarg' exception
+        (Erlang core analyzer — fires for `put_elem`)
+    warning: expected a tuple with at least 6 elements in Kernel.elem/2:
+        elem({1, 2}, 5)
+        the given type does not have the given index:
+            {integer(), integer()}
+    warning: expected a tuple with at least 5 elements in Tuple.insert_at/3:
+        Tuple.insert_at({1, 2}, 5, :x)
+    (and analogous for delete_at)
+
+For `put_elem` only the generic Erlang warning fires — no Elixir
+typesystem "expected a tuple with at least N elements" message. Runtime
+all four raise `ArgumentError` (1st argument out of range).
+
+Same gap on a negative literal index:
+
+    put_elem({1, 2}, -1, :x)   # no Elixir type warning either
+
+Source: `lib/elixir/lib/module/types/apply.ex`.
+
+  * `:erlang.element`         line 438 — special `do_remote/8` clause with
+                              bounds check via `tuple_fetch`.
+  * `:erlang.insert_element`  line 461 — bounds check via `tuple_insert_at`.
+  * `:erlang.delete_element`  line 482 — bounds check via `tuple_delete_at`.
+  * `:erlang.setelement`      no special clause; falls through to the generic
+                              spec at line 235:
+        {:erlang, :setelement,
+          [{[integer(), open_tuple([]), term()], dynamic(open_tuple([]))}]}
+
+Adding a `do_remote(:erlang, :setelement, ...)` clause analogous to
+`insert_element`/`delete_element` would close the gap. The fix is small and
+local.
+
+
+================================================================================
+CLAIM B (was 4) — COSMETIC: `Tuple.insert_at` with a negative literal index
+emits a meaningless error: "expected a tuple with at least -1 elements".
+================================================================================
+
+Repro:
+
+    defmodule T do
+      def a, do: Tuple.insert_at({1, 2}, -1, :x)
+    end
+
+Output:
+
+    warning: expected a tuple with at least -1 elements in Tuple.insert_at/3:
+        Tuple.insert_at({1, 2}, -1, :x)
+    the given type does not have the given index:
+        {integer(), integer()}
+
+"At least -1 elements" is not a meaningful constraint. The check
+correctly fires (-1 is not a valid index), but the wording is computed
+from `index - 1` at `apply.ex:463`:
+
+    tuple_type = open_tuple(List.duplicate(term(), max(index - 1, 0)))
+
+When `index = -1`, `max(index - 1, 0) = 0`, but the diagnostic itself
+substitutes the raw `index` and `index - 1` into the message template. The
+right shape of error is a domain error on the index (e.g. "index must be
+between 0 and tuple_size, got -1"), not a tuple-shape error with a
+nonsense bound. Both `elem` and `Tuple.delete_at` exhibit similar wording
+on negative indices but with their own arithmetic (`elem({},-1)` →
+"at least 0 elements", which is at least non-nonsensical).
+
+
+================================================================================
+CLAIM C (was 5) — TYPE WIDENING (acknowledged in #15369 thread): a dead
+`case` clause whose body returns a non-`none()` value still contributes
+its body type to the case's result type.
+================================================================================
+
+This is not novel — `@josevalim` already agreed to a follow-up in the
+#15369 comments — included for completeness and to show it is testable
+via the helper.
+
+Reproduction via helper:
+
+    typecheck!(case :ok do
+      :error -> 1
+      :ok    -> :ok
+    end)
+    # => :ok or integer()
+
+Runtime: always `:ok`. Static type returned: `:ok or integer()`.
+
+Source: `lib/elixir/lib/module/types/expr.ex:480-486`. A clause is
+excluded from `body_acc` only when `precise? and empty?(body_type)`. A
+provably-unreachable clause whose body returns a literal does not satisfy
+`empty?(body_type)` and merges in. Allowed under the task scope (false
+negative / widening), noted because it is the same family of issue as
+#15369.
+
+
+================================================================================
+CLAIM D (was 6) — TYPE WIDENING: `try`/`rescue` unions the rescue clause
+body type into the result even when the body provably cannot raise the
+matched exception.
+================================================================================
+
+    typecheck!(
+      try do
+        1 + 1
+      rescue
+        KeyError -> :got_key_err
+      end
+    )
+    # => :got_key_err or integer()
+
+`1 + 1` is a typed arithmetic op (cannot raise `KeyError`). The rescue
+clause is unreachable, but `:got_key_err` is still unioned into the
+return. Sound (it is widening, not narrowing), but it loses precision
+that other constructs do not.
+
+Source: `lib/elixir/lib/module/types/expr.ex:525-573` and the `:rescue`
+clause handling. The typechecker doesn't reason about which exceptions a
+body can raise vs. the patterns of rescue clauses; every rescue clause is
+treated as live. Same family as Claim C.
+
+
+================================================================================
+What I tested and did NOT find (so the file isn't padded with non-findings)
+================================================================================
+
+* The "case/cond/if body rebinding leaks narrowing" hypothesis — wrong
+  premise, see retraction above.
+* `Map.get(m, :missing, :default)` reported as error: intentional
+  (`apply.ex:939-944`); not a bug per current contract.
+* `Process.delete/1` returning `dynamic(not :undefined)`: sound (the
+  Elixir wrapper nilifies `:undefined`).
+* `Map.merge(%{a: 1}, %{b: 2})` returning `dynamic()`: precision loss,
+  widening, allowed.
+* Multi-clause `cond` (3+ clauses) drops all narrowing across branches:
+  also acknowledged limitation; not a new finding.
+
+The original #15369 example (cond head provably false + raising tail
+narrowing `x` to `binary()`) is a real bug, but it's already filed.
+
+
+================================================================================
+Reproduction
+================================================================================
+
+All snippets compile under `bin/elixirc <file>.exs`. The `typecheck!`
+forms in Claims C and D use the `TypeHelper` macro at
+`lib/elixir/test/elixir/module/types/type_helper.exs`.

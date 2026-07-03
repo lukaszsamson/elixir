@@ -1,0 +1,1408 @@
+Compilation, Metadata and Correctness Issues
+=============================================
+
+1. DEAD format_error CLAUSES — never emitted (elixir_expand.erl:1265,1310) - not a bug
+---------------------------------------------------------------------------
+  format_error({invalid_clauses, Name})
+  format_error({nested_comparison, CompExpr})
+
+Never emitted anywhere in the codebase. Grepping lib/ confirms zero callers.
+
+
+2. DEAD format_error CLAUSE — {undefined_var_in_spec, Var} (elixir_bitstring.erl:421) - not a bug
+-------------------------------------------------------------------------------------
+Never emitted anywhere.
+
+
+3. DEAD format_error CLAUSE — {no_macros, Module} (elixir_import.erl:262) - not a bug
+-------------------------------------------------------------------------
+Never emitted anywhere.
+
+
+4. DEAD format_error CLAUSE — {no_module, ...} (elixir_def.erl:417) - not a bug
+-------------------------------------------------------------------
+Never emitted anywhere.
+
+
+5. WRONG MODULE NAME IN prune_stacktrace (elixir_dispatch.erl:352) - FIXED
+------------------------------------------------------------------
+  prune_stacktrace([{Mod, _, _, _} | _], _MFA, Info, _E)
+      when Mod == elixir_dispatch; Mod == elixir_exp ->
+
+Module `elixir_exp` does not exist. The actual module is `elixir_expand`.
+Stacktrace frames from elixir_expand are never pruned during macro
+expansion error handling, making error stacktraces noisier.
+
+Should be: Mod == elixir_expand
+
+
+6. function_error CALLED WITH FILE PATH INSTEAD OF ENVIRONMENT (elixir_map.erl:96) - not a bug
+----------------------------------------------------------------------------------
+  #{context := match} -> function_error(Meta, ?key(E, file), ?MODULE, {repeated_key, Key});
+
+Passes binary file path instead of full environment map E. function_error's
+first clause checks #{function := {_, _}} which never matches a binary,
+so it always falls through to file_error (no_return). This means a repeated
+map key in match context ALWAYS hard-crashes compilation instead of
+accumulating as a module error. Every other function_error call in the
+codebase passes the full E map.
+
+
+7. MALFORMED ERROR MESSAGE (elixir_map.erl:296-298) - not a bug
+----------------------------------------------------
+  format_error({invalid_key_for_struct, Key}) ->
+    io_lib:format("invalid key ~ts for struct, struct keys must be atoms, got: ",
+                  ['Elixir.Macro':to_string(Key)]);
+
+Format string ends with dangling "got: " with no value after it.
+
+
+8. INCOMPLETE CASE IN concat_or_prepend_bitstring (elixir_bitstring.erl:105-119) - Fixed
+--------------------------------------------------------------------------------
+  case ERight of
+    {binary, _, nil} -> ...;
+    {bitstring, _, nil} -> ...
+  end;
+
+No catch-all. After a type mismatch on a nested bitstring inside a function
+body (e.g., <<(<<1>>)::integer>>), function_error accumulates the error
+but does NOT halt. The code continues and crashes with {case_clause, ...}
+because ERight is {integer, _, nil}.
+
+
+9. INCONSISTENT BitstrMeta PROPAGATION (elixir_bitstring.erl:52 vs 64) - fixed
+----------------------------------------------------------------------
+The :: path preserves original BitstrMeta for recursion. The bare element
+path replaces it with the current element's Meta. After a bare element,
+subsequent elements inherit the previous element's meta instead of the
+original bitstring's meta, causing incorrect line numbers in errors.
+
+
+10. MISSING CATCH-ALL IN is_sigil INNER CASE (elixir_import.erl:191-198) - fixed
+------------------------------------------------------------------------
+  case Letters of
+    [L] when L >= $a, L =< $z -> true;
+    [] -> false;
+    [H|T] when H >= $A, H =< $Z -> lists:all(...)
+  end
+
+No catch-all. Multi-char lowercase sigils (sigil_ab/2), digit-start sigils
+(sigil_1/2) crash with case_clause. Any module exporting such a function
+crashes `import ... only: :sigils`.
+
+
+11. has_unquotes/2 RESETS QuoteLevel FOR CALL NAME (elixir_quote.erl:57-58) - fixed
+---------------------------------------------------------------------------
+  has_unquotes({Name, _, Args}, QuoteLevel) when is_list(Args) ->
+    has_unquotes(Name) orelse ...
+
+Calls has_unquotes/1 which resets QuoteLevel to 0 for Name. Inside nested
+quotes, this produces false positives — reports active unquotes where none
+exist at the current nesting level.
+
+Should be: has_unquotes(Name, QuoteLevel) orelse ...
+
+
+12. tail_list CRASHES ON EMPTY splicing WITH IMPROPER TAIL (elixir_quote.erl:584-587) - fixed
+-------------------------------------------------------------------------------------
+  tail_list(Left, Right, Tail) when is_list(Left) ->
+    validate_list(Left),
+    [H | T] = lists:reverse(Tail ++ Left),
+
+If both Tail and Left are [], the reverse is [] and [H|T] = [] crashes
+with badmatch. Triggered by: quote do: [unquote_splicing([]) | some_expr]
+where some_expr is not a list.
+
+
+13. BOOTSTRAP PATH DISCARDS EXECUTION RESULT (elixir_lexical.erl:31-33) - not a bug
+-----------------------------------------------------------------------
+  true ->
+    ExecutionCallback(E),
+    AfterExecutionCallback(E)
+
+Non-bootstrap path correctly captures and returns ExecutionCallback result.
+Bootstrap path discards it and returns AfterExecutionCallback result (ok).
+The caller (elixir_module compile/6) gets ok instead of {module, Module,
+Binary, Result} during bootstrap.
+
+
+14. HARDCODED map_size == 15 FOR Macro.Env (elixir.erl:198) - not a bug
+------------------------------------------------------------
+  env_for_eval(#{'__struct__' := 'Elixir.Macro.Env', ...} = Env)
+      when map_size(Env) == 15 ->
+
+If Macro.Env ever gains/loses a field, this guard silently fails. The
+second clause requires is_list(Opts), so a Macro.Env with wrong size
+matches NEITHER clause → opaque function_clause crash.
+
+
+15. TOKENIZER WARNINGS DISCARDED ON ERROR (elixir.erl:446-448) - not a bug
+--------------------------------------------------------------
+  {error, Info, _Rest, _Warnings, _SoFar} ->
+    {error, elixir_tokenizer:format_error(Info)}
+
+Warnings accumulated before the tokenization error are silently lost.
+Deprecation warnings preceding a syntax error are never shown.
+
+
+16. MISLEADING INDENTATION — CLAUSE LOOKS LIKE BODY (elixir_compiler.erl:130-135) - not a bug
+---------------------------------------------------------------------------------
+  only_defmodule({'__block__', _, Exprs}) ->
+    lists:all(fun only_defmodule/1, Exprs);
+    only_defmodule({defmodule, _, [_, [{do, _}]]}) ->
+    true;
+
+Second function clause is indented as if inside the first clause's body.
+Compiles correctly (`;` terminates the clause) but extremely misleading.
+
+
+17. MISLEADING INDENTATION — CLAUSE LOOKS LIKE BODY (elixir_config.erl:77-81) - not a bug
+-----------------------------------------------------------------------------
+  handle_call({serial, Fun}, _From, State) ->
+    {reply, Fun(), State};
+    handle_call({put, Key, Value}, _From, State) ->
+    ets:insert(?MODULE, {Key, Value}),
+
+Same issue. Second handle_call clause indented as if inside first clause.
+
+
+18. format_error CALLS overridables_for AT FORMAT TIME (elixir_overridable.erl:129) - low priority/not a bug
+----------------------------------------------------------------------------------
+  format_error({no_super, Module, {Name, Arity}}) ->
+    Bins = [format_fa(Tuple) || Tuple <- overridables_for(Module)],
+
+overridables_for calls elixir_module:data_tables(Module) which is NOT
+wrapped in try/catch. If module ETS tables are already deleted, this
+crashes during error formatting.
+
+
+19. IO.warn DOUBLE STACKTRACE (kernel/typespec.ex:843-850) - fix on a branch
+----------------------------------------------------------
+  warning =
+    "string() type use is discouraged..." <>
+      Exception.format_stacktrace(Macro.Env.stacktrace(caller))
+  IO.warn(warning, caller)
+
+Manually appends stacktrace to message, then passes caller to IO.warn
+which also generates a stacktrace. Stacktrace appears twice in output.
+Same issue for nonempty_string() at lines 854-859.
+
+
+20. @moduledoc SAYS case/2 IS LEXICAL (kernel/special_forms.ex:16-17) - not a bug
+---------------------------------------------------------------------
+  Some of these special forms are lexical (such as `alias/2` and `case/2`).
+
+case/2 is not lexical — it's runtime control flow. alias/2 is lexical.
+
+
+21. expand_as ACCEPTS TRAILING-DOT ALIASES (elixir_aliases.erl:45 + 67-69) - not a bug
+--------------------------------------------------------------------------
+string:tokens collapses consecutive/trailing dots, so 'Elixir.Foo.' passes
+validation as a 1-segment alias. The last/2 function returns [] for
+trailing-dot names, creating alias to invalid 'Elixir.' atom.
+`alias SomeModule, as: :'Elixir.Foo.'` silently creates a broken alias.
+
+
+22. MapMeta REUSED AS BOUND VARIABLE IN CASE PATTERNS (elixir_map.erl:28,33,41) - wrong pattern but not a bug
+-------------------------------------------------------------------------------
+  expand_struct(Meta, Left, {'%{}', MapMeta, MapArgs}, S, ...) ->
+    ...
+    case ERight of
+      {'%{}', MapMeta, [{'|', _, [_, Assocs]}]} ->
+      {'%{}', MapMeta, Assocs} when Context /= match ->
+      {'%{}', MapMeta, Assocs} ->
+
+MapMeta is already bound. These patterns perform equality checks against
+the original. If expand_map ever modifies Meta during expansion, all
+branches silently fail to match, falling through to the catch-all which
+skips struct validation entirely.
+
+
+23. defguard EXPANDS ONLY IN GUARD CONTEXT (kernel/utils.ex:331-334) - reported
+--------------------------------------------------------------------
+  env = :elixir_env.with_vars(%{env | context: :guard}, vars)
+  {expr, _, _} = :elixir_expand.expand(expr, :elixir_env.env_to_ex(env), env)
+
+The expanded AST is reused for both the guard branch AND the non-guard
+branch. Context-dependent macros (e.g., Kernel.and → :erlang.andalso in
+guards, case expression outside) get guard-specific expansions in both.
+
+
+This looks like a real bug.
+What I verified:
+1. The implementation does exactly what the report says.
+   - lib/elixir/lib/kernel/utils.ex:331-342
+   - defguard/3 expands expr once with:
+      env = :elixir_env.with_vars(%{env | context: :guard}, vars)
+   {expr, _, _} = :elixir_expand.expand(expr, :elixir_env.env_to_ex(env), env)
+      - then reuses that single expanded expr for:
+     - the Macro.Env.in_guard?(__CALLER__) == true branch
+     - the false branch too
+2. The non-guard branch really gets guard-specific expansion.
+   - Repro:
+      Code.compile_string("""
+   defmodule G do
+     defguard g(x) when x and true
+   end
+   """, "g.ex")
+   ast = quote(do: G.g(foo()))
+   IO.puts(Macro.to_string(Macro.expand_once(ast, %{__ENV__ | requires: [G]})))
+      - Output:
+      {arg1} = {foo()}
+   :erlang.andalso(arg1, true)
+      - So the non-guard expansion is not arg1 and true; it is the guard form :erlang.andalso/2.
+3. This changes observable runtime behavior today.
+   - With:
+      defmodule G do
+     defguard g(x) when x and true
+     def run(x), do: g(x)
+   end
+      - Current behavior:
+      G.run(nil)
+   # raises ArgumentError: argument error: nil
+      - But ordinary Elixir non-guard and semantics are:
+      nil and true
+   # raises BadBooleanError
+      - I confirmed the difference directly:
+     - x and true raises BadBooleanError for non-booleans
+     - :erlang.andalso(x, true) raises ArgumentError
+Why this is a real bug:
+- defguard is explicitly supposed to produce:
+  - one form for guard contexts
+  - another form for ordinary expression contexts
+- The module docs in Kernel.Utils.defguard/3 even describe that split.
+- Reusing the guard-expanded AST in both branches makes the non-guard branch semantically wrong for context-sensitive operators/macros.
+Current triage:
+- Real issue: yes
+- Reachable: yes
+- User-visible: yes
+- Severity: correctness bug in defguard expansion
+Strongest minimal repro:
+defmodule G do
+  defguard g(x) when x and true
+  def run(x), do: g(x)
+end
+G.run(nil)
+Observed:
+- ArgumentError
+Expected from non-guard semantics:
+- BadBooleanError
+So this is a confirmed, present-day bug.
+
+
+24. returns_boolean CRASHES ON EMPTY __block__ (elixir_utils.erl:246-247) - not a bug
+------------------------------------------------------------------------
+  returns_boolean({'__block__', _, Exprs}) ->
+    returns_boolean(lists:last(Exprs));
+
+lists:last([]) crashes with function_clause. No guard against empty Exprs.
+
+
+25. bag_lookup_element WITHOUT try/catch (elixir_def.erl:257) - not a bug
+------------------------------------------------------------
+  Callbacks = ets:lookup_element(Bag, {accumulate, on_definition}, 2),
+
+Direct ets:lookup_element without try/catch protection. Compare with
+bag_lookup_element wrapper used elsewhere in elixir_module.erl.
+
+
+26. match?/2 GENERATES CASE WITH EMPTY METADATA (kernel.ex:3616-3628) - not a bug
+---------------------------------------------------------------------
+  {:case, [], [expression, [do: success ++ failure]]}
+
+No line info or optimization annotations. Compare with if/unless/and/or
+which use annotate_case to add line, optimize_boolean, type_check metadata.
+
+
+27. DOUBLED "warning:" PREFIX IN check_derive MESSAGES (module.ex:2000,2003) - confirmed, low priority
+---------------------------------------------------------------------------
+  message =
+    case :ets.lookup(set, {:elixir, :struct}) do
+      [] ->
+        "warning: module attribute @derive was set but never used ..."
+      _ ->
+        "warning: module attribute @derive was set after defstruct ..."
+    end
+
+  IO.warn(message, env)
+
+The messages already contain a "warning: " prefix. IO.warn passes the
+message to :elixir_errors.emit_diagnostic(:warning, ...) which formats
+the output with its own "warning:" prefix. The result is:
+
+  warning: warning: module attribute @derive was set but never used ...
+
+These are the ONLY two IO.warn calls in lib/elixir/lib/ whose message
+text starts with "warning:". Every other IO.warn call omits the prefix.
+
+
+28. DOC SAYS `C:\TMP` FALLBACK BUT CODE ONLY CHECKS `/tmp` (system.ex:398-411) - INVALID
+-------------------------------------------------------------------------------
+  @doc says:
+    4. `C:\TMP` on Windows or `/tmp` on Unix-like operating systems
+
+  Code:
+    write_env_tmp_dir(~c"TMPDIR") || write_env_tmp_dir(~c"TEMP") ||
+      write_env_tmp_dir(~c"TMP") ||
+      write_tmp_dir(~c"/tmp") || write_cwd_tmp_dir()
+
+The code checks `/tmp` on ALL platforms. There is no `C:\TMP` check for
+Windows. On native Windows `/tmp` won't exist (unless WSL), so the code
+falls through to cwd. The documented `C:\TMP` fallback is never executed.
+In practice Windows typically has TEMP/TMP env vars set so the env var
+checks succeed first, but the doc is still wrong about the fallback path.
+
+
+29. DOC SAYS :sigstop BUT @vm_signals HAS :sigterm (system.ex:543-546 vs 138) - PR SUBMITTED
+-----------------------------------------------------------------------------
+  @doc says:
+    By default, the Erlang VM register traps to the three signals:
+      * `:sigstop` - gracefully shuts down the VM with `stop/0`
+      * `:sigquit` - halts the VM via `halt/0`
+      * `:sigusr1` - halts the VM via status code of 1
+
+  Code:
+    @vm_signals [:sigquit, :sigterm, :sigusr1]
+    @os_signals [:sighup, :sigabrt, :sigalrm, :sigusr2, :sigchld, :sigstop, :sigtstp]
+
+The doc lists :sigstop as a default VM trap, but the code has :sigterm in
+@vm_signals and :sigstop in @os_signals. The `trapping?/1` function uses
+@vm_signals to decide which signals stay trapped even after all user
+handlers are removed. So :sigterm is always-trapped but :sigstop is not —
+opposite of what the docs say. SIGSTOP is also untrappable on most Unix
+systems, making the doc doubly wrong.
+
+
+30. @doc since: "1.14" MISSING PATCH VERSION (access.ex:966) - not a bug
+------------------------------------------------------------
+  @doc since: "1.14"
+  @spec slice(Range.t()) :: access_fun(data :: list, current_value :: list)
+
+Every other @doc since in the entire codebase uses "X.Y.0" format (e.g.,
+"1.14.0"). This one is missing the ".0" patch version.
+
+
+31. @spec requirements :: [] IS WRONG TYPE (mix/task.ex:279) - FIXED
+------------------------------------------------------------
+  @spec requirements(task_module) :: []
+  def requirements(module) when is_atom(module) do
+    {:requirements, requirements} =
+      List.keyfind(module.__info__(:attributes), :requirements, 0, {:requirements, []})
+    requirements
+  end
+
+The spec says `:: []` which is literally the empty list type. The function
+returns a list of strings (task requirement strings). The @doc confirms:
+"Returns a list of strings". Should be `:: [binary()]`.
+
+
+32. @spec write_according_to_opts! RETURN TYPE WRONG (mix/utils.ex:322) - INVALID
+----------------------------------------------------------------------
+  @doc "Returns the name of the file written to, or \"-\" if output was to STDOUT."
+  @spec write_according_to_opts!(Path.t(), iodata(), write_opts) :: Path.t()
+
+The function returns `file_spec` which can be "-" (when output option is
+"-" for stdout). The @doc documents this, but the @spec says `:: Path.t()`
+which doesn't cover the "-" case. Should be `:: Path.t() | binary()` or
+just `:: binary()`.
+
+Same issue in:
+  - write_json_tree! (line 351) — calls write_according_to_opts!, spec says :: Path.t()
+  - write_dot_graph! (line 478) — calls write_according_to_opts!, spec says :: Path.t()
+
+
+33. Mix.Dep @type t MISSING `deps` FIELD (mix/dep.ex:69-80) - FIXED
+-----------------------------------------------------------
+The struct defines `deps: []` (line 62) and the @doc documents the `deps`
+field ("dependencies of this dependency"). But the @type t spec at lines
+69-80 omits the `deps` field entirely. All other struct fields are present
+in the type. Tools relying on the type spec won't know about `deps`.
+
+
+Triage
+I triaged the items in comp_issues_claude.txt against the current tree.
+Real bugs
+1. elixir_dispatch.erl: prune_stacktrace checks elixir_exp instead of elixir_expand.
+Reason: typo is real in source; elixir_expand frames won't match that clause.
+2. elixir_map.erl: malformed invalid_key_for_struct message.
+Reason: repro shows error: invalid key 1 for struct, struct keys must be atoms, got: with the value missing.
+3. elixir_bitstring.erl: inconsistent BitstrMeta propagation.
+Reason: this is the same metadata bug already in comp_issues.txt.
+4. elixir_quote.erl: has_unquotes/2 resets quote level for call names.
+Reason: source clearly calls has_unquotes(Name) instead of has_unquotes(Name, QuoteLevel).
+5. elixir_quote.erl: tail_list/3 crashes on empty splice with improper tail.
+Reason: reproduced; quote do: [unquote_splicing([]) | :x] crashes with MatchError in tail_list/3.
+6. elixir.erl: env_for_eval/1 hardcodes map_size(Env) == 15.
+Reason: brittle and real; if Macro.Env shape changes, clause selection breaks.
+7. elixir_overridable.erl: format_error({no_super, ...}) calls overridables_for/1 at format time.
+Reason: real pattern; formatting depends on live module ETS state.
+8. kernel/typespec.ex: stacktrace is appended manually and also passed to IO.warn.
+Reason: source shows duplicated stacktrace construction; likely duplicated output.
+9. module.ex: doubled "warning: " prefix in @derive warnings.
+Reason: reproduced; output is warning: warning: ....
+10. system.ex: docs say C:\TMP fallback but implementation only checks /tmp.
+Reason: already in comp_issues.txt.
+11. system.ex: docs say default VM trap is :sigstop, code uses :sigterm.
+Reason: source contradicts docs, and @vm_signals confirms it.
+12. mix/task.ex: @spec requirements(task_module) :: [] is wrong.
+Reason: runtime returns lists of requirement strings; spec is too narrow.
+13. mix/utils.ex: write_according_to_opts!/3 return spec is wrong for "-".
+Reason: reproduced; it returns "-" when writing to stdout, while spec says Path.t() only.
+14. mix/dep.ex: Mix.Dep.t omits the deps field.
+Reason: source shows struct has deps, type does not.
+15. elixir_utils.erl: returns_boolean/1 crashes on empty __block__.
+Reason: reproduced via :elixir_utils.returns_boolean({:__block__, [], []}).
+Real bugs, but already covered in comp_issues.txt
+1. elixir_bitstring.erl: metadata propagation bug.
+2. kernel/typespec.ex: duplicate stacktrace warning formatting.
+3. module.ex: doubled warning: prefix.
+4. system.ex: C:\TMP docs mismatch.
+False positives / not substantiated
+1. Dead format_error clauses (invalid_clauses, nested_comparison, undefined_var_in_spec, no_macros, no_module).
+Reason: “not grep-referenced” is not enough; many error descriptors are built dynamically or from Erlang paths. I did not verify these as dead bugs.
+2. elixir_map.erl: function_error called with file path instead of env “always hard-crashes compilation”.
+Reason: wrong argument is real and ugly, but the claimed behavior is overstated. file_error/4 explicitly accepts a binary file path. Repro shows a normal diagnostic plus compile failure, not a crash from bad argument shape.
+3. elixir_bitstring.erl: missing catch-all in concat_or_prepend_bitstring.
+Reason: likely unreachable because non-binary/bitstring path falls to the outer catch-all clause after the {'<<>>', ...} head; the specific claimed case_clause was not verified.
+4. elixir_import.erl: missing catch-all in is_sigil inner case.
+Reason: not user-reachable through normal Elixir/Erlang function naming; the stronger, actually reproducible bug here is the Erlang-module __info__/1 crash already recorded.
+5. elixir_lexical.erl: bootstrap path discards execution result.
+Reason: direct bootstrap-mode repro returned ok, but from elixir_module callsites that callback also returns ok; no concrete failure demonstrated.
+6. elixir_compiler.erl / elixir_config.erl: misleading indentation.
+Reason: style/readability issue only, not a correctness/metadata/compilation bug.
+7. kernel/special_forms.ex: docs say case/2 is lexical.
+Reason: documentation issue, but not a compilation/metadata/correctness bug in code behavior.
+8. elixir_aliases.erl: trailing-dot alias accepted.
+Reason: reproduced as accepted/compiled alias, but practical impact is minor and closer to input-validation oddity than a strong bug. Still weaker than the confirmed items above.
+9. kernel/utils.ex: defguard expands only in guard context and reuses guard expansion in non-guard branch.
+Reason: source does that, but the provided and example is not convincing because and is macro-expanded to :erlang.andalso in normal code too. I didn’t confirm a semantic miscompile.
+10. kernel.ex: match?/2 uses empty metadata.
+Reason: metadata omission exists, but no concrete bad behavior was demonstrated.
+Doc/spec-only issues
+1. access.ex: @doc since: "1.14" missing patch version.
+2. mix/task.ex: wrong requirements/1 spec.
+3. mix/utils.ex: wrong return specs for write_according_to_opts!/3, write_json_tree!/4, write_dot_graph!/5.
+4. mix/dep.ex: Mix.Dep.t missing deps.
+5. system.ex: :sigstop vs :sigterm docs mismatch.
+6. kernel/special_forms.ex: case/2 called lexical in docs.
+Best additions if you want to promote Claude findings into your main list
+1. elixir_dispatch.erl typo in prune_stacktrace
+2. elixir_map.erl malformed invalid_key_for_struct message
+3. elixir_quote.erl has_unquotes/2 quote-level bug
+4. elixir_quote.erl tail_list/3 empty splice crash
+5. elixir_utils.erl returns_boolean/1 empty block crash
+6. system.ex :sigstop docs mismatch
+7. mix/task.ex / mix/utils.ex / mix/dep.ex spec issues
+
+
+New findings pass (lib/elixir/src only)
+=======================================
+
+34. generate_struct_name_guard HAS NO BASE CASE (elixir_erl_pass.erl:743-752) - INVALID
+-------------------------------------------------------------------
+  generate_struct_name_guard([{map_field_exact, Ann, {atom, _, '__struct__'} = Key, Var} | Rest], Acc, S0) ->
+    ...;
+  generate_struct_name_guard([Field | Rest], Acc, S) ->
+    generate_struct_name_guard(Rest, [Field | Acc], S).
+
+No clause for []. If a translated struct map somehow does not carry a
+`__struct__` map_field_exact entry, this recurses off the end and
+crashes with function_clause. Not currently reachable from a well-formed
+`%Var{...}` because translate_struct prepends `{__struct__, Name}`, but
+the invariant is not asserted and the function is brittle against future
+translate_map changes.
+
+
+35. format_error USES ~w FOR ARITY (elixir_lexical.erl:118-121) - low priority
+-----------------------------------------------------------------------
+  format_error({unused_import, {Module, Function, Arity}}) ->
+    io_lib:format("unused import ~ts.~ts/~w", [..., Function, Arity]);
+
+Uses `~w` for Arity, while every other unused-import-like diagnostic in
+the codebase uses `~B`. Output is still correct for integer arity but
+inconsistent with the rest of the tree.
+
+
+36. args_from_arity DROPS Meta FOR SYNTHETIC CAPTURE ARGS (elixir_fn.erl:178-181) - INVALID
+--------------------------------------------------------------------------------
+  args_from_arity(_Meta, A, _E) when is_integer(A), A >= 0, A =< 255 ->
+    [{'&', [], [X]} || X <- lists:seq(1, A)];
+
+The outer `&Mod.fun/Arity` expansion builds synthetic `&N` argument
+references with empty metadata, discarding the Meta of the capture site.
+Any downstream diagnostic produced on one of those synthetic args loses
+file/line/column information. Note the sibling form `capture` path in
+elixir_erl_pass.erl does pass Meta through, so this is inconsistent.
+
+
+37. expand_captures Arity=0 RELIES ON tl([0]) (elixir_erl_pass.erl:105-117) - not a bug
+-------------------------------------------------------------------------------
+  translate({'&', Meta, [{'/', _, [{Fun, _, Atom}, Arity]}]}, Ann, S)
+      when is_atom(Fun), is_atom(Atom), is_integer(Arity) ->
+    case S of
+      #elixir_erl{expand_captures=true} ->
+        {Vars, SV} = lists:mapfoldl(..., tl(lists:seq(0, Arity))),
+
+The guard accepts any integer. For Arity == 0 this evaluates to
+`tl([0])` which is []. For Arity < 0 (e.g. coming from malformed
+ASTs constructed directly), `lists:seq(0, -1)` is [] and `tl([])`
+crashes with a raw function_clause/badarg. Ordinary tokenizer input
+can't produce this but programmatic AST (Code.eval_quoted) can.
+
+
+38. validate_opts SILENTLY SKIPS NON-TUPLE ELEMENTS (elixir_expand.erl:1007-1010) - low priority
+--------------------------------------------------------------------------------
+  validate_opts(Meta, Kind, Allowed, Opts, E) when is_list(Opts) ->
+    [begin
+      file_error(Meta, E, ?MODULE, {unsupported_option, Kind, Key})
+    end || {Key, _} <- Opts, not lists:member(Key, Allowed)];
+
+The list comprehension pattern-matches on `{Key, _}`. If Opts contains
+any element that is not a 2-tuple (e.g. `[:foo, {:as, Bar}]`), that
+element is silently filtered out. Upstream `options_are_not_keyword`
+clause only triggers for non-list `Opts`. So mixed lists with bare
+atoms bypass validation and the bad atom reaches downstream lookups.
+
+
+39. assert_no_underscore_clause_in_cond CRASHES ON EMPTY CLAUSES (elixir_expand.erl:1139-1145) - INVALID
+------------------------------------------------------------------------------------------
+  assert_no_underscore_clause_in_cond([{do, Clauses}], E) when is_list(Clauses) ->
+    case lists:last(Clauses) of
+      ...
+    end;
+
+Guard requires Clauses to be a list, but does not check it's non-empty.
+`lists:last([])` crashes with function_clause. Triggered by
+`cond do end` where the parser allows an empty do block, before
+elixir_clauses:'cond' validation gets a chance to produce a normal
+error.
+
+
+40. format_error({unused_option, Kind, Key}) USES ~s FOR Kind ATOM (elixir_expand.erl:1294-1296) - not a bug
+------------------------------------------------------------------------------------------
+  format_error({unsupported_option, Kind, Key}) ->
+    io_lib:format("unsupported option ~ts given to ~s",
+                  ['Elixir.Macro':to_string(Key), Kind]);
+
+`~s` with an atom works (Erlang converts to string) but every other
+diagnostic in this file uses `~ts` for atom printouts. Inconsistent but
+not wrong.
+
+
+41. try-else warning only triggers in one key order (elixir_clauses.erl:376-381) - INVALID
+-------------------------------------------------------------------------------------
+  case Opts of
+    [{do, _}, {'else', _}] ->
+      file_warn(Meta, ..., {try_with_only_else_clause, ...});
+    _ ->
+      ok
+  end,
+
+The `else as only clause of try` warning uses a strict pattern on the
+exact `[{do, _}, {else, _}]` shape. A two-element list with keys in
+reversed order `[{else, _}, {do, _}]` (possible via programmatic AST
+construction or keyword normalization differences) bypasses the warning.
+Later assert_at_most_once checks still pass, so a program with
+try/else and no catch/rescue/after silently compiles.
+
+
+New findings pass (lib/elixir/lib only)
+=======================================
+
+42. TYPO "auction" IN JSON.Encoder @moduledoc (json.ex:27) - PR submitted
+---------------------------------------------------------
+  > Prefer using `:only` to avoid accidentally leaking private information when
+  > new fields are added. Other approaches should be used with auction.
+
+"with auction" should be "with caution". Line 16 and the docstring at
+line 47-49 both use "caution"/"used carefully" correctly for the same
+concept. Visible on hex docs for the `JSON.Encoder` protocol. User-facing
+documentation bug.
+
+
+43. Range.shift/2 CRASHES ON OLD-FORMAT RANGES WITH non-zero shift (range.ex:287-293) - WONT FIX
+-------------------------------------------------------------------------------------
+  def shift(%Range{} = range, 0), do: range
+  def shift(first..last//step, steps_to_shift) when is_integer(steps_to_shift) do
+    ...
+
+The `Range.shift(range, 0)` clause accepts any `%Range{}` including the
+legacy `step: nil` shape (used by ranges coming from older .beam files
+via debug_info, which `size/1` and `to_list/1` explicitly handle with
+TODO-on-v2 fallthrough clauses). For any non-zero shift, the second
+clause uses the `first..last//step` pattern, which only matches the
+new step-bearing shape, so shifting a legacy range by anything other
+than 0 raises FunctionClauseError. `size/1` and `to_list/1` have the
+compat clause; `shift/2` does not.
+
+
+44. Range.disjoint?/2 SAME LEGACY-RANGE GAP (range.ex:479) - WONT FIX
+---------------------------------------------------------
+  def disjoint?(first1..last1//step1 = range1, first2..last2//step2 = range2) do
+
+Only accepts new-format ranges. Calling
+`Range.disjoint?(%Range{first: 1, last: 3, step: nil}, 1..5)` crashes
+with FunctionClauseError. Same backwards-compat hole as `shift/2`.
+Consistency problem relative to `size/1` / `to_list/1`.
+
+
+New findings pass (lib/elixir/lib/kernel only)
+==============================================
+
+45. each_cycle @TYPE DISAGREES WITH ACTUAL CALLBACK ARITY (kernel/parallel_compiler.ex:28-30 vs 587) - FIXED
+-----------------------------------------------------------------------------------------------
+  @type compile_opts :: [
+          ...
+          each_cycle: ([module()], [Code.diagnostic(:warning)] ->
+                         {:compile, [module()], [Code.diagnostic(:warning)]}
+                         | {:runtime, [module()], [Code.diagnostic(:warning)]}),
+          ...
+        ]
+
+But line 587 invokes the callback with **zero arguments**:
+  profile(state, "cycle resolution", fn -> each_cycle_return(state.each_cycle.()) end)
+
+The default callback at line 357 is also zero-arity:
+  each_cycle: Keyword.get(options, :each_cycle, fn -> {:runtime, [], []} end)
+
+Any consumer who trusts the spec and passes a 2-arity fn crashes at
+runtime with BadArityError. The @type must be `(-> {...} | {...})`.
+
+
+46. `--warnings-as-errors` AT elixirc IS SILENTLY IGNORED (kernel/cli.ex:523 + parallel_compiler.ex) - not a bug
+----------------------------------------------------------------------------------------------
+  opts =
+    verbose_opts ++
+      [
+        profile: config.profile,
+        warnings_as_errors: config.warnings_as_errors,
+        return_diagnostics: true
+      ]
+
+  case Kernel.ParallelCompiler.compile_to_path(files, output, opts) do
+    {:ok, _, _} -> :ok
+    {:error, _, _} -> exit({:shutdown, 1})
+  end
+
+The `:warnings_as_errors` option is passed into
+Kernel.ParallelCompiler.compile_to_path, but grep confirms
+Kernel.ParallelCompiler never reads it (the only references are in
+Mix.Tasks.Test / Mix.Compilers.Elixir, not the parallel compiler). CLI
+also does not inspect `info.compile_warnings` / `info.runtime_warnings`
+after the call to fail the build on warnings. So `elixirc
+--warnings-as-errors foo.ex` parses the flag, stores it in config, and
+does nothing with it. `Code.put_compiler_option/2` for the same key is
+deprecated and points users at the CLI flag, so the only officially
+supported pathway is now a no-op.
+
+
+47. MISSING `warnings_as_errors` IN compile_opts @TYPE (kernel/parallel_compiler.ex:22-40) - not a bug
+------------------------------------------------------------------------------------
+If the option is meant to work (per the cli.ex call and the
+Code.put_compiler_option/2 deprecation message telling users to use the
+flag), then compile_opts() should list `warnings_as_errors: boolean`.
+If it is intentionally unsupported, the CLI should not forward it and
+the public-facing deprecation message in code.ex:1897-1902 that
+redirects users to the flag is misleading.
+
+
+48. case/2 DOCTEST BLOCK MIXES ...> CONTINUATION (kernel/special_forms.ex:1937-1943)
+-------------------------------------------------------------------------------
+  iex> case {:ok, 7} do
+  ...>   {:ok, value} -> value
+  ...>   :error -> nil
+  ...> end
+
+  ...> value
+  ** (CompileError) undefined variable "value"
+
+After `...> end` and a blank line, the next `...>` starts a fresh
+block. ExUnit.DocTest parses `...>` only as a continuation of a prior
+`iex>`, so a standalone `...> value` without a preceding `iex>` is an
+ill-formed doctest fragment. SpecialForms macros all call `error!` at
+runtime and aren't actually executed as doctests, so this doesn't fail
+a test run today — but it is misleading to readers who copy-paste the
+example into iex and it would break if doctest coverage were ever
+enabled for this module.
+
+
+New findings pass (lib/elixir/lib/module only)
+==============================================
+
+No new confirmed user-facing bugs found in this pass beyond items already
+tracked (#41 / #42 / #43 for Module.Types.Descr gradual-type drops).
+
+Candidate weaknesses that are not strong enough to report as bugs:
+
+A. Module.Types.Helpers.integer_to_ordinal @doc typo ("itneger")
+   (module/types/helpers.ex:60). Internal (@moduledoc false), not
+   user-facing.
+
+B. Module.Types.Expr line 11 brittle compile-time assertion
+   `14 = length(Macro.Env.__info__(:struct))`. This is the same style
+   of sanity check as `elixir.erl:198 when map_size(Env) == 15` and is
+   intentional, not a bug.
+
+C. Module.ParallelChecker init/1 (parallel_checker.ex:541-558):
+      case :elixir_config.get(:infer_signatures) do
+        false -> false
+        applications ->
+          for application <- applications do ... end
+      end
+   Assumes the value is `false` or a list. `Code.put_compiler_option/2`
+   normalizes `true` to `[:elixir]` and rejects other values, so this
+   assumption holds via the public API. If anything bypasses
+   `Code.put_compiler_option/2` and writes a non-list/non-false directly
+   via `:elixir_config.put/2`, the `for` comprehension on line 546
+   crashes with Enumerable.Protocol error. Defensive only.
+
+D. Module.Behaviour.behaviour_defined?/2 (module/behaviour.ex:228-236):
+     Enum.any?(fn
+       {_kind, ^behaviour, _optional?} -> true
+       {_kind, _behaviour, _optional?} -> false
+     end)
+   An earlier review (agent) flagged this as "catch-all always returns
+   false, so the function is dead". Verified against Elixir anonymous
+   function semantics: clauses are tried in order, the pinned clause
+   matches first when the behaviour matches, so the function behaves
+   correctly. NOT a bug — documenting here so the false positive does
+   not get re-reported.
+
+If anything user-facing exists in this subtree, it would most likely be
+in the `format_diagnostic/1` callbacks (module/types/{apply,of,expr,
+pattern}.ex, module/types.ex, module/behaviour.ex). Those are consumed
+through `Module.ParallelChecker.group_diagnostics/1 → emit_diagnostics/3`
+and printed verbatim to users. Sampling of each clause did not surface
+a mismatch with the tuple shape passed in from the collectors.
+
+
+IO module pass (lib/elixir/lib/io.ex, lib/elixir/lib/io/*.ex)
+=============================================================
+
+I1. IO.getn/2 — @spec and clause ordering disagree about 2-arity "device" support
+---------------------------------------------------------------------------------
+io.ex:532-549
+
+  @spec getn(
+          device | chardata | String.Chars.t(),
+          pos_integer | :eof | chardata | String.Chars.t()
+        ) :: chardata | nodata
+  def getn(prompt, count \\ 1)
+
+  def getn(prompt, :eof),      do: getn(:stdio, prompt, :eof)
+  def getn(prompt, count) when is_integer(count) and count > 0,
+                                 do: getn(:stdio, prompt, count)
+  def getn(device, prompt) when not is_integer(prompt),
+                                 do: getn(device, prompt, 1)
+
+The @spec advertises `(device, ...)` for the first arg in all second-arg
+shapes (including `:eof` and positive integer). Clause 1 and clause 2
+unconditionally consume those shapes and treat the first arg as a
+*prompt*, never as a device. Consequences:
+
+  * IO.getn(:stdio, :eof)
+      => getn(:stdio, :stdio, :eof)
+      => reads from :stdio but prints "stdio" as the prompt
+  * IO.getn(some_pid, :eof)
+      => getn(:stdio, some_pid, :eof)
+      => crashes with Protocol.UndefinedError in
+         to_chardata(pid) -> to_string(pid)
+  * IO.getn(some_pid, 5)  — same story for integer count
+
+Only `IO.getn(device, non_integer_prompt)` actually routes to the
+device via clause 3. The @doc at io.ex:524 ("Gets a number of bytes
+from IO device `:stdio`") further contradicts clause 3, which does
+accept a custom device. So there are three documents that disagree:
+the docstring says stdio-only, the @spec suggests any-device, and the
+clauses only allow device when the second arg is a non-integer prompt.
+
+Pick one story:
+  a) Tighten the @spec to `chardata | String.Chars.t()` as first arg
+     (matching the docstring) and drop clause 3, OR
+  b) Keep clause 3 and add clauses that handle `(device, :eof)` and
+     `(device, pos_integer)` shapes to match the @spec.
+
+Either way the current state is a latent footgun: the @spec type-checks
+usages the implementation doesn't actually support.
+
+
+I2. IO.puts/2 has an is_device/1 guard, write/2 and binwrite/2 do not
+--------------------------------------------------------------------
+io.ex:283-310, 330-333, and the guard at 147
+
+  defguardp is_device(term) when is_atom(term) or is_pid(term)
+
+  def write(device \\ :stdio, chardata) do ...                   # no guard
+  def binwrite(device \\ :stdio, iodata) when is_iodata(iodata)  # guards the data arg only
+  def puts(device \\ :stdio, item) when is_device(device) do ... # guards the device arg
+
+Minor API inconsistency. The three text-output functions share the
+same contract on their device argument (atom | pid for puts/write,
+plus tuple for binwrite via map_dev/1), but only puts/2 fails fast on
+an invalid device. write/2 fails deeper, inside map_dev/1; binwrite/2
+does not validate device at all (tuples are accepted by map_dev).
+
+Separately, `is_device/1` excludes raw file-descriptor tuples that
+`map_dev/1` otherwise allows. That's defensible for puts (io:put_chars
+requires a process anyway) but the three functions should be
+consistent.
+
+
+I3. Error partway through IO.read(device, :eof) / IO.binread(device, :eof) silently drops already-read data - NOT A BUG
+-----------------------------------------------------------------------------------------------------------
+io.ex:261-267 (binread_eof) and io.ex:578-584 (getn_eof)
+
+  defp binread_eof(mapped_dev, acc) do
+    case :file.read(mapped_dev, @read_all_size) do
+      {:ok, data} -> binread_eof(mapped_dev, acc <> data)
+      :eof        -> if acc == "", do: :eof, else: acc
+      other       -> other                 # <-- loses `acc`
+    end
+  end
+
+  defp getn_eof(device, prompt, acc) do
+    case :io.get_line(device, prompt) do
+      line when is_binary(line) or is_list(line) ->
+        getn_eof(device, ~c"", [line | acc])
+      :eof  -> wrap_eof(:lists.reverse(acc))
+      other -> other                       # <-- loses `acc`
+    end
+  end
+
+If the device returns `{:error, reason}` after several successful
+chunks/lines, the function returns just the error tuple and discards
+every byte already consumed. The spec allows `nodata` (and callers
+like IO.each_binstream/2 raise on it), so this is more of a
+data-retention surprise than a type violation — but it means a
+transient mid-stream error is indistinguishable from a failure at the
+very first read. Consider preferring `{:error, reason, acc}` or
+returning the accumulated data with the error tagged.
+
+Not clearly a user-facing bug, documenting for reference.
+
+
+I4. IO.iodata_empty?/1 silently accepts non-iodata - NOT A BUG
+--------------------------------------------------
+io.ex:815-820
+
+  def iodata_empty?(""),            do: true
+  def iodata_empty?([]),            do: true
+  def iodata_empty?([head | tail]), do: iodata_empty?(head) and iodata_empty?(tail)
+  def iodata_empty?(_),             do: false
+
+Fallback returns `false` for anything non-matching, including bitstrings
+that are not binaries (e.g. `<<0::1>>`), integers outside 0..255, atoms,
+tuples, PIDs, etc. The @spec restricts the input to `iodata`, so this
+is defensive rather than buggy, but in a language without erasure a
+silent `false` for `iodata_empty?(nil)` can mask caller bugs: the
+function neither raises nor matches the clause-based style used in the
+rest of the module (compare binwrite/2's `is_iodata/1` guard).
+
+Adding `when is_iodata(data)` to the public arity — matching binwrite's
+approach — would make garbage inputs fail loudly.
+
+Not a bug per the @spec, noting for consistency.
+
+
+I5. IO.ANSI.enabled?/0 return type is not validated - NOT A BUG
+---------------------------------------------------
+io/ansi.ex:52-55
+
+  @spec enabled? :: boolean
+  def enabled? do
+    Application.get_env(:elixir, :ansi_enabled, false)
+  end
+
+Reads a config value and claims a boolean return. If any code sets
+`:elixir, :ansi_enabled` to something non-boolean (e.g. `:auto`, nil),
+this function returns that value and then breaks the default argument
+of `format/2` / `format_fragment/2`:
+
+  def format(ansidata, emit? \\ enabled?()) when is_boolean(emit?) do ...
+
+…which raises FunctionClauseError only when format is called, not when
+the bad config is set. In practice `iex -S mix` and the Elixir boot
+code never set a non-boolean value; this is only reachable if an
+application clobbers the env var. Noting for defensive-review, not a
+confirmed bug.
+
+
+I6. IO.ANSI.syntax_colors/0 uses fetch_env! — raises if Elixir hasn't been booted through its normal path - NOT A BUG
+---------------------------------------------------------------------------------------------------------
+io/ansi.ex:79-83
+
+  @spec syntax_colors :: Keyword.t(ansidata)
+  def syntax_colors do
+    Application.fetch_env!(:elixir, :ansi_syntax_colors)
+  end
+
+The @doc describes a documented default (`[atom: :cyan, ...]`), but the
+function itself has no fallback — it relies on Elixir setting the env
+var at startup (see lib/elixir/src/elixir.erl). If someone evaluates
+`IO.ANSI.syntax_colors/0` in an escript / embedded environment that
+starts only `:elixir` as a code loader and skips the config
+initialisation, this raises ArgumentError rather than returning the
+documented defaults.
+
+Not a bug in mainline Elixir but brittle — compare `enabled?/0` which
+uses `get_env` with an explicit fallback.
+
+
+Code module pass (lib/elixir/lib/code.ex, lib/elixir/lib/code/*.ex)
+===================================================================
+
+C1. Code.Fragment.container_cursor_to_quoted/2 silently drops :file, :line, :column options
+------------------------------------------------------------------------------------------------------------
+code/fragment.ex:1269-1277
+
+  def container_cursor_to_quoted(fragment, opts \\ []) do
+    {trailing_fragment, opts} = Keyword.pop(opts, :trailing_fragment)
+    {preserve_sigils?, opts} = Keyword.pop(opts, :preserve_sigils, false)
+    opts = Keyword.take(opts, [:columns, :token_metadata, :literal_encoder])
+    opts = [check_terminators: {:cursor, preserve_sigils?, []}] ++ opts
+
+    file = Keyword.get(opts, :file, "nofile")     # always "nofile"
+    line = Keyword.get(opts, :line, 1)            # always 1
+    column = Keyword.get(opts, :column, 1)        # always 1
+
+The `Keyword.take/2` on line 1272 strips the options list down to exactly
+`[:columns, :token_metadata, :literal_encoder]`. The documented options
+`:file`, `:line`, `:column` (all listed in `@type
+container_cursor_to_quoted_opts` and in the @doc "Options" section) are
+dropped from `opts` BEFORE the three `Keyword.get` lookups on lines
+1275-1277. Consequently the subsequent calls
+
+    :elixir_tokenizer.tokenize(to_charlist(fragment), line, column, opts)
+    :elixir.tokens_to_quoted(tokens, file, opts)
+
+always tokenize/parse as if the fragment began at `nofile:1:1`,
+regardless of what the caller passed.
+
+Repro (elixir main):
+
+  $ bin/elixir -e 'IO.inspect(Code.Fragment.container_cursor_to_quoted(
+      "foo(", file: "sample.ex", line: 10, column: 3, columns: true))'
+  {:ok, {:foo, [line: 1, column: 1], [{:__cursor__, [line: 1, column: 5], []}]}}
+
+Expected the AST metadata to carry `line: 10` (starting line) with the
+`column` adjusted by the caller-supplied starting column, and for
+`{:error, {loc, ...}}` failure cases to report the right file/line.
+Both are wrong.
+
+Suggested fix: read the three values from the original `opts` before
+narrowing, or include `:file`, `:line`, `:column` in the `Keyword.take`
+allowlist.
+
+Note: this is also tracked as item in the human-authored comp_issues.txt
+(found independently during this pass; keeping here for completeness).
+
+
+C2. Code.compiler_options/1 is non-atomic and reports misleading errors on unknown keys
+---------------------------------------------------------------------------------------
+code.ex:1683-1689
+
+  def compiler_options(opts) do
+    for {key, value} <- opts, into: %{} do
+      previous = get_compiler_option(key)
+      put_compiler_option(key, value)
+      {key, previous}
+    end
+  end
+
+Two issues at once:
+
+1. Non-atomic on failure. When the comprehension processes
+   `compiler_options(docs: false, made_up: :oops)`, it:
+     a. reads previous `:docs`
+     b. writes `:docs` = false
+     c. reads previous `:made_up` → raises
+   Because writes happen inside the comprehension, the iteration order
+   determines which options persist across the raise. The caller gets
+   an exception but observing with
+   `Code.get_compiler_option(:docs)` shows the partial change.
+
+   Repro:
+     $ bin/elixir -e '
+         IO.inspect(Code.get_compiler_option(:docs))
+         try do
+           Code.compiler_options(docs: false, made_up: :oops)
+         rescue e -> IO.puts(Exception.message(e)) end
+         IO.inspect(Code.get_compiler_option(:docs))'
+     true
+     no function clause matching in Code.get_compiler_option/1
+     false
+
+2. Misleading exception text. The raise comes from
+   `get_compiler_option(:made_up)` via its guard
+   `when key in @available_compiler_options` (code.ex:1704), so the
+   user sees `FunctionClauseError` naming `get_compiler_option/1`, even
+   though the real problem is that `:made_up` is not a valid compiler
+   option. `put_compiler_option/2` would raise with the clear message
+   "unknown compiler option: :made_up" — but the code path reads before
+   it writes.
+
+Suggested fix: validate all keys before mutating (e.g. check
+`key in @available_compiler_options` for each pair first, or route
+through `put_compiler_option/2` which has a dedicated error), and
+only then apply.
+
+
+C3. Code.Typespec.erl_to_ex_var/1 crashes on an empty atom variable name - NOT A BUG
+-------------------------------------------------------------------------
+code/typespec.ex:399-407
+
+  defp erl_to_ex_var(var) do
+    case Atom.to_string(var) do
+      <<"_", c::utf8, rest::binary>> -> ...
+      <<c::utf8, rest::binary>> -> ...
+    end
+  end
+
+Neither clause matches when `Atom.to_string(var) == ""` (i.e. the
+variable atom is `:""`). The function is unreachable via normal Erlang
+abstract-format type expressions because Erlang type vars are never
+empty atoms, but the helper is plain `defp` with no defensive clause.
+Noting for completeness — edge case only.
+
+
+C4. Code.Normalizer.maybe_escape_literal/2 permanently creates new atoms - INVALID
+------------------------------------------------------------------------
+code/normalizer.ex:551-556
+
+  defp maybe_escape_literal(atom, %{escape: true} = state) when is_atom(atom) do
+    atom
+    |> Atom.to_string()
+    |> maybe_escape_literal(state)
+    |> String.to_atom()
+  end
+
+For atoms that contain characters requiring escape (non-printable
+bytes, bidi controls, confusables flagged in
+Code.Identifier.escape_char/2), this path uses `String.to_atom/1` on
+the escaped form, creating a brand-new atom that did not previously
+exist in the atom table (the escaped form is literally different bytes
+from the original atom's value — e.g. `:"foo\nbar"` becomes `:"foo\\nbar"`).
+
+Because atoms are never reclaimed, calling `Code.quoted_to_algebra/2`
+on an AST containing many distinct "unusual" atoms leaks atom-table
+entries on each call. Under attacker-controlled input this is a slow
+atom-exhaustion vector. The usual `Code.format_string!/2` path is safe
+— it does not run the normalizer — but `quoted_to_algebra/2` is
+part of the public API (since v1.13.0).
+
+Suggested fix: keep the escaped form as a binary inside the
+`{:__block__, [delimiter: "\""], [binary]}` wrapper used for strings,
+rather than round-tripping back to an atom; the formatter already
+renders atom literals from their string form.
+
+Severity: low/latent. Needs a caller that (a) uses
+`Code.quoted_to_algebra/2` rather than `format_string!/2`, and
+(b) feeds it ASTs containing attacker-chosen atoms.
+
+
+System / Task / Path / File / Config pass
+==========================================
+
+S1. Config.validate!/2 silently accepts invalid config shapes - FIXED
+-----------------------------------------------------------------------------
+lib/elixir/lib/config.ex:380-395
+
+  defp validate!(config, file) do
+    Enum.all?(config, fn
+      {app, value} when is_atom(app) ->
+        if Keyword.keyword?(value) do
+          true
+        else
+          raise ArgumentError, ...
+        end
+
+      _ ->
+        false
+    end)
+
+    config
+  end
+
+The `Enum.all?` is invoked for side-effects (the raise in clause 1's else
+branch), but its return value is discarded — the function always returns
+`config`. The fallback `_ -> false` clause just short-circuits the
+comprehension without raising. Net effect: when the evaluated config
+contains a pair whose key is NOT an atom (or anything that isn't a
+2-tuple at all), validation silently passes it through.
+
+Repro (elixir main):
+
+  $ bin/elixir -e '
+      File.write!("/tmp/bad.exs", "[{\"not_atom\", [key: :val]}, {:valid, [k: :v]}]")
+      IO.inspect(Config.Reader.read!("/tmp/bad.exs"))'
+  [{"not_atom", [key: :val]}, {:valid, [k: :v]}]
+
+Expected: `File.Error`/`ArgumentError` complaining that the top-level
+config must be a list of `{atom, keyword}` pairs, since that is what
+`__eval__!/3` promises and what downstream consumers
+(`Config.Provider`, Application env) require. Instead the malformed
+list flows through and fails later with a less localised error.
+
+Suggested fix:
+
+  defp validate!(config, file) do
+    Enum.each(config, fn
+      {app, value} when is_atom(app) ->
+        if not Keyword.keyword?(value) do
+          raise ArgumentError,
+                "expected config for app #{inspect(app)} in " <>
+                "#{Path.relative_to_cwd(file)} to return keyword list, " <>
+                "got: #{inspect(value)}"
+        end
+
+      other ->
+        raise ArgumentError,
+              "expected each config entry in #{Path.relative_to_cwd(file)} " <>
+              "to be a {atom, keyword} pair, got: #{inspect(other)}"
+    end)
+
+    config
+  end
+
+
+S2. File.stream!/3 infinite-loops when both positional args are lists — LOW/NOT A BUG - MISUSE/DEPRECATED
+-------------------------------------------------------------------------------------
+lib/elixir/lib/file.ex:2231-2245
+
+  def stream!(path, line_or_bytes, modes)
+
+  def stream!(path, modes, line_or_bytes) when is_list(modes) do
+    # TODO: Remove me on Elixir 2.0
+    IO.warn(
+      "File.stream!(path, modes, line_or_byte) is deprecated, " <>
+        "invoke File.stream!(path, line_or_bytes, modes) instead"
+    )
+
+    stream!(path, line_or_bytes, modes)
+  end
+
+  def stream!(path, line_or_bytes, modes) do
+    modes = normalize_modes(modes, true)
+    File.Stream.__build__(IO.chardata_to_string(path), line_or_bytes, modes)
+  end
+
+The first clause exists as a deprecation shim for the old argument
+order: it detects the legacy call by `is_list(modes)` on the SECOND
+argument and swaps. But it never checks whether the THIRD argument
+(`line_or_bytes`) is actually a valid `:line | pos_integer`. If the
+caller passes a list in BOTH positions (e.g. `File.stream!(path, [],
+[])` or `File.stream!(path, [:read_ahead], [:utf8])`), the shim
+swaps and recurses with both-lists again — matching the same clause
+forever.
+
+Repro:
+
+  $ timeout 3 bin/elixir -e '
+      ref = Process.monitor(spawn(fn ->
+        File.stream!("/tmp/nonexistent", [], [])
+      end))
+      receive do
+        {:DOWN, ^ref, _, _, reason} -> IO.puts("DIED: #{inspect(reason)}")
+      after 2000 -> IO.puts("STILL ALIVE after 2s (infinite loop)")
+      end'
+  STILL ALIVE after 2s (infinite loop)
+
+The process never dies (deprecation warning is `IO.warn`, not
+`IO.warn_once`, so it re-triggers every iteration — the stderr output
+is what eventually slows the loop). Public @spec says
+`line_or_bytes :: :line | pos_integer`, so passing a list violates the
+spec, but there is no guard — the loop would be avoided by either:
+
+  * Adding a guard to the first clause:
+    `when is_list(modes) and (line_or_bytes == :line or is_integer(line_or_bytes))`
+  * Guarding the "correct" clause to only match `:line | pos_integer`
+    and letting malformed input raise `FunctionClauseError`.
+
+Severity: low (requires misuse) but it's an unbounded loop in a widely
+used helper.
+
+
+S3. System.halt/1 accepts negative integers though @spec says non_neg_integer - not a bug
+-----------------------------------------------------------------------------
+lib/elixir/lib/system.ex:846-856
+
+  @spec halt() :: no_return
+  @spec halt(non_neg_integer | binary | :abort) :: no_return
+  def halt(status \\ 0)
+
+  def halt(status) when is_integer(status) or status == :abort do
+    :erlang.halt(status)
+  end
+
+The guard is `is_integer(status)` (any integer), but the @spec and
+@doc restrict to non-negative. Negative integers bypass the Elixir
+guard and then fail with a less-clear `:erlang.halt/1` badarg. The
+guard should mirror the spec: `when (is_integer(status) and status
+>= 0) or status == :abort`. Minor; documentation-vs-implementation
+drift.
+
+
+S4. System.cmd_opts duplicate option entries are silently merged - not a bug
+----------------------------------------------------------------
+lib/elixir/lib/system.ex:1200-1234
+
+  defp cmd_opts([{:into, any} | t], opts, _into, line, stdio?),
+    do: cmd_opts(t, opts, any, line, stdio?)
+  defp cmd_opts([{:cd, bin} | t], opts, into, line, stdio?) when is_binary(bin),
+    do: cmd_opts(t, [{:cd, bin} | opts], into, line, stdio?)
+  ...
+  defp cmd_opts([{:lines, max_line_length} | t], opts, into, _line, stdio?)
+       when is_integer(max_line_length) and max_line_length > 0,
+       do: cmd_opts(t, [{:line, max_line_length} | opts], into, true, stdio?)
+
+Passing the same option twice (e.g. `System.cmd("echo", [],
+cd: "/a", cd: "/b")`) silently layers both entries into `opts`, so
+the port sees `[cd: "/a", cd: "/b"]` and picks one non-deterministically.
+The loop should either take-the-last or reject duplicates. Low
+severity, but the docs claim a "strict set of options" is enforced
+and raises for unknown/invalid options — the strictness breaks down
+for duplicates.
+
+
+S5. Path.relative/1 returns "." for "/" (inconsistent with other inputs) - NOT A BUG
+------------------------------------------------------------------------
+lib/elixir/lib/path.ex:287-304
+
+  defp unix_pathtype(path) when path in ["/", ~c"/"], do: {:absolute, "."}
+  ...
+
+  defp relative(name, os_type) do
+    pathtype(name, os_type) |> elem(1) |> IO.chardata_to_string()
+  end
+
+`Path.relative("/") == "."`, whereas `Path.relative("/foo") == "foo"`
+and `Path.relative("") == ""`. The "." stems from the `unix_pathtype`
+special-case for "/" returning `{:absolute, "."}` instead of
+`{:absolute, ""}`. Callers that strip a leading slash to produce
+relative paths will see an unexpected `"."`. Not a bug per se — more
+of a surprising edge case worth documenting or normalizing.
+
+
+Stream / Enum / String pass
+============================
+
+T1. String.count/2 crashes on empty-list pattern despite typedoc allowing it — FIXED
+---------------------------------------------------------------------------------------------
+lib/elixir/lib/string.ex:755-765, cf. type at 285-299
+
+  @type pattern ::
+          t()
+          | [nonempty_binary]
+          | (compiled_search_pattern :: :binary.cp())
+
+  # typedoc at lines 286-295:
+  # > Pattern used in functions like `replace/4` and `split/3`.
+  # >   It must be one of:
+  # >     * a string
+  # >     * an empty list
+  # >     * a list containing non-empty strings
+  # >     * a compiled search pattern ...
+
+  @spec count(t, pattern | Regex.t()) :: non_neg_integer
+  @doc since: "1.19.0"
+  def count(string, <<>>), do: length(string) + 1
+
+  def count(string, pattern) when is_struct(pattern, Regex) do
+    Kernel.length(Regex.scan(pattern, string, return: :index))
+  end
+
+  def count(string, pattern) do
+    Kernel.length(:binary.matches(string, pattern))
+  end
+
+The `@type pattern` — and its typedoc, which is explicit — lists the
+empty list `[]` as a valid pattern value. Every other public function
+that takes a `pattern` has a special clause for it (`split/3` at
+line 534, `replace/4` at line 1645, `splitter/3` at line 631,
+`contains?/2` list path at line 2903, `starts_with?/2` and
+`ends_with?/2` at lines 2761/2809). `count/2` is missing that clause
+and falls through to `:binary.matches(string, [])`, which raises
+ArgumentError.
+
+Repro:
+
+  $ bin/elixir -e 'IO.inspect(String.count("hello", []))'
+  ** (ArgumentError) errors were found at the given arguments:
+
+    * 2nd argument: not a valid pattern
+
+      (stdlib 7.2) :binary.matches("hello", [])
+
+Expected `0` by analogy with `String.contains?("hello", []) == false`
+(nothing in the empty pattern-list can match, so the count is zero).
+
+Since count/2 was added in v1.19.0, this is a recent gap — the
+special-case clause was simply missed.
+
+Suggested fix: add a clause before the generic one:
+
+  def count(_string, []), do: 0
+
+
+T2. Stream.cycle/1 of a repeatedly-empty resource loops without progress - FIXED
+------------------------------------------------------------------------
+lib/elixir/lib/stream.ex:1431-1442
+
+  defp do_cycle(reduce, inner_acc, cycle, {:cont, acc}, fun) do
+    case reduce.({:cont, inner_acc}) do
+      {:suspended, [element], new_reduce} ->
+        do_cycle(new_reduce, inner_acc, cycle, fun.(element, acc), fun)
+
+      {_, [element]} ->
+        do_cycle(cycle, [], cycle, fun.(element, acc), fun)
+
+      {_, []} ->
+        do_cycle(cycle, [], cycle, {:cont, acc}, fun)   # <- restart without emitting
+    end
+  end
+
+The `check_cycle_first_element` wrapper at line 1448 only guards the
+*first* reduce call. On subsequent restarts, an empty-yielding inner
+reduce (`{_, []}`) triggers a plain `do_cycle(cycle, [], cycle,
+{:cont, acc}, fun)` — an unbounded recursion with no progress and no
+element produced to the consumer.
+
+This is reachable when the wrapped enumerable's `Enumerable.reduce/3`
+implementation can legitimately yield nothing on a given call but is
+not empty in the "first element" sense — e.g., a stream whose
+upstream became exhausted between two cycles, or a custom enumerable
+whose reduce returns `{:done, []}` at the end and treats re-invocation
+as "re-initialize" but then yields nothing again.
+
+For list inputs this doesn't apply (they hit the separate
+`cycle(enumerable) when is_list(enumerable)` clause which uses
+`unfold/2`). The issue is in the generic/stream branch.
+
+Severity: low (requires pathological enumerable), but the non-first
+`{_, []}` path should also raise "cannot cycle over an empty
+enumerable" or at least terminate the stream rather than spin.
+
+
+T3. String.count/2 also raises on `[""]` (list-with-empty-string) although so do split and replace — noting for consistency only - NOT A BUG
+---------------------------------------------------------------------------------------------------------------------------------
+lib/elixir/lib/string.ex
+
+The pattern value `[""]` (list containing an empty string) violates
+`[nonempty_binary]` in `@type pattern`, so raising is technically
+consistent with the type. However:
+
+  * `String.contains?("abc", [""])` → `true`
+  * `String.starts_with?("abc", [""])` → `true`
+  * `String.split("abc", [""])` → raises ArgumentError
+  * `String.replace("abc", [""], "X")` → raises ArgumentError
+  * `String.count("abc", [""])` → raises ArgumentError
+  * `String.splitter("abc", [""])` → raises ArgumentError (on first
+    Enum step)
+
+`contains?` and `starts_with?` list-iterate and short-circuit on empty
+head (returning `true`); the others funnel straight into
+`:binary.matches` which rejects it. Not a bug per the type, but the
+family is internally inconsistent.
+
+Severity: cosmetic. Noting because users who first try `contains?`
+and then switch to `split`/`count` will be surprised.

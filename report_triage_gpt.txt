@@ -1,0 +1,122 @@
+Most of the remaining report is over-claimed. The big pattern is: if the premise is “attacker can run macros, compiler tracers, on_load, on_definition, tamper ETS from same node, set compiler env vars, or inject BEAM/debug-info into the compiler,” that is generally not a new vuln in Elixir’s model. Compilation already executes trusted code.
+Triage
+Likely Not Security Issues
+- 163 public elixir_modules ETS hijack
+- 776 public per-module ETS callback/attribute tampering
+- 1521 --remsh
+- 1923 import/require hijack via AST metadata
+- 2676 public elixir_config ETS / tracer injection
+- 3210 return_compiler_module cast / arbitrary purge
+- 3550, 586 __escape__/1 execution / AST injection
+- 4108 predictable bootstrap cache keys
+- 4452 ERL_COMPILER_OPTIONS
+- 5093 on_definition callback injection
+- 5290 struct expansion race for unintended module
+- 5455 lexical tracker PID exposure
+- 5576 process-dict BEAM injection
+- 6427 module loading side effects in tainted expansion
+- 6961 forgeable {if_undefined, apply} metadata
+Reason: all of these assume capabilities Elixir already treats as trusted compile/build/node access. They may describe alternate paths to arbitrary code execution, but not new privilege boundaries.
+Real But Not Security
+- 4221 eval process-dictionary reentrancy
+- 1, 2149, 4985 recursive macro expansion DoS claims
+- 1154, 1676, 2352, 2581, 4574, 6701 atom exhaustion claims
+Reason:
+- 4221 is a real correctness/diagnostics bug, not a vuln.
+- recursive macro expansion is mostly “trusted macros can already loop forever”; worth hardening maybe, but not high-severity security.
+- atom creation items mostly describe APIs/compiler paths that intentionally intern atoms from trusted source; that is not a new security boundary.
+Already Fixed / Already Labeled
+- 350 fixed
+- 469 fixed
+- 1791 fixed
+- 3080 fixed
+- 5788 fixed
+- plus 4221 already effectively triaged as “reported, only reentrancy is real”
+Worth Keeping As Actual Bugs / Hardening
+These are the ones that still look actionable on their own merits:
+- 105 ANSI injection in unused-import warning
+- 251 ANSI injection in parse errors
+- 1089 path traversal in elixir_compiler:binary_to_path/2
+- 4822 missing upper bound on capture position
+- 6118 unbounded recursive parsing via string_tokens_parse
+Why:
+- 105: Function is formatted with ~ts unsanitized in elixir_lexical.erl; that can corrupt terminal/log output.
+- 251: parse error formatting reconstructs user-controlled binary content and splices it into messages unsanitized.
+- 1089: binary_to_path/2 does filename:join(CompilePath, atom_to_list(ModuleName) ++ ".beam") with no containment check. If weird module atoms with separators are accepted upstream, this can write outside the intended directory.
+- 4822: elixir_fn:escape/3 accepts any positive integer &N, while only 1..255 is valid. That is a real correctness bug.
+- 6118: nested interpolation reparses recursively without an explicit depth bound; that looks like a real crash/DoS bug.
+Borderline / Needs Deeper Review
+- 3832 debug_info(core_v1) compile options
+- 6836 no_parens_remote/2
+Notes:
+- 6836 is not arbitrary invocation in the scary sense; the code explicitly does apply(Atom, Fun, []) for deprecated module.function syntax without parens in elixir_erl_pass.erl:757-769. That is surprising behavior, but it looks like intentional compatibility semantics, not a vuln.
+- 3832 is the only “execution” claim I’d still want a closer look at, because BEAM debug-info processing may cross a different trust boundary than normal macro execution. Still, likely low priority unless there is a concrete untrusted-BEAM ingestion path.
+Recommended shortlist
+If you want a focused follow-up list, I’d keep only:
+1. ANSI injection in warnings/errors (105, 251)
+2. binary_to_path/2 containment/path traversal (1089)
+3. capture upper-bound validation (4822)
+4. recursive interpolation parsing depth (6118)
+5. eval PD reentrancy as correctness (4221)
+
+I read both files and spot-checked the code. Mostly agree with the framing — "if the attacker can run compile-time code, it's not a new boundary" — but the triage is missing ~10 items from report.txt and  
+  misplaces one.                                                                                                                                                                                               
+                                                                                                                                                                                                               
+  Verified claims                                                                                                                                                                                              
+                                                                                                                                                                                                               
+  Already labeled fixed (confirmed inline in report.txt): 350, 469, 1791, 3080, 5788 — ✓                                                                                                                       
+                                                                                                                                                                                                               
+  Worth-keeping shortlist (spot-checked against source):                                                                                                                                                       
+  - 105 — elixir_lexical.erl:119 does io_lib:format("unused import ~ts.~ts/~w", [... Module-sanitized ..., Function, Arity]). Function atom is raw. ✓
+  - 251 — elixir_errors.erl:373 splices Content2 (parsed from user sigil bytes) into the message raw. ✓                                                                                                        
+  - 1089 — elixir_compiler.erl:247 does filename:join(CompilePath, atom_to_list(ModuleName) ++ ".beam") with no containment. ✓ Caveat: reaching this requires defining a module with a weird atom, which 
+  already means running macros — same trust boundary as the "not security" group. Fine as hardening, but the framing should match.                                                                             
+  - 4822 — elixir_fn.erl:149 is escape({'&', Meta, [Pos]}, E, Dict) when is_integer(Pos), Pos > 0. No upper bound. ✓                                                                                           
+  - 6118 — string_tokens_parse recurses per interpolation nesting. Erlang stacks are heap-backed so this is memory exhaustion, not stack overflow — still a DoS, keep as hardening. ✓                          
+                                                                                                                                                                                                               
+  Items the GPT triage missed entirely                                                                                                                                                                         
+                                                                                                                                                                                                               
+  These are in report.txt but not categorized at all:                                                                                                                                                          
+                                                                                                                                                                                                               
+  ┌──────┬────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐   
+  │ Line │                                Item                                │                                                            Call                                                            │
+  ├──────┼────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 946  │ binary_to_term/1 without safe in elixir_erl.erl:117                │ Not security — PIDs/ports/refs are compiled from the running compile host, attacker would need BEAM-tamper ability already │
+  ├──────┼────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 1318 │ Symlink TOCTOU in elixir_utils file ops                            │ Not security — same trust model                                                                                            │   
+  ├──────┼────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
+  │ 2866 │ apply/3 result injection in elixir_erl_pass.erl:704-715            │ Likely not security (compile-time apply of trusted callable)                                                               │   
+  ├──────┼────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
+  │ 3408 │ for resource leak                                                  │ Real correctness, not security                                                                                             │
+  ├──────┼────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
+  │ 3687 │ code:purge/delete in error handler                                 │ Not security — trusted compile                                                                                             │
+  ├──────┼────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
+  │ 3962 │ Dynamic dispatch in elixir_rewrite.erl error formatting            │ Worth a second look, but probably also trusted                                                                             │
+  ├──────┼────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
+  │ 4676 │ Marked "not a bug" inline in the report itself                     │ Skip                                                                                                                       │
+  ├──────┼────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
+  │ 5953 │ Null-byte/UTF-8 bypass in characters_to_list/binary                │ Borderline — worth keeping as hardening, same class as 1089                                                                │
+  ├──────┼────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
+  │ 6250 │ error:undef catch exposing module_info(exports)                    │ Not a real boundary — a malicious module can already export anything                                                       │
+  ├──────┼────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
+  │ 6581 │ Bare CR trojan-source in comments (elixir_tokenizer.erl:1333-1344) │ Worth keeping — same class as the already-fixed 469                                                                        │
+  └──────┴────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘   
+                  
+  Corrections I'd make to the shortlist                                                                                                                                                                        
+                  
+  Add 6581 (bare CR trojan source) — it's literally the same class as 469, which is already listed as fixed. The ?break macro covers VT/FF/NEL/LS/PS but not \r, and tokenize_comment falls through on it.     
+  Report confirms it's "reported" inline.
+                                                                                                                                                                                                               
+  Add 5953 as borderline/hardening — null-byte in paths is a defense-in-depth concern paired with 1089.                                                                                                        
+  
+  Bottom line                                                                                                                                                                                                  
+                  
+  GPT's "trusted compilation = not a new boundary" framing is correct for the bulk of the report. The shortlist is accurate but incomplete: add 6581 (and arguably 5953), and GPT simply didn't address ~8     
+  issues. If you want a final actionable list:
+                                                                                                                                                                                                               
+  1. 105, 251 — ANSI sanitization in warnings/errors                                                                                                                                                           
+  2. 1089 (+ 5953) — path containment / null-byte hardening
+  3. 4822 — cap &N at 255                                                                                                                                                                                      
+  4. 6118 — depth bound on interpolation parser                                                                                                                                                                
+  5. 6581 — add bare CR to ?break (missing from GPT's list)                                                                                                                                                    
+  6. 4221 — eval PD reentrancy (correctness)

@@ -1,0 +1,472 @@
+================================================================================
+COMPILER INTERNALS AUDIT — lib/elixir/src + lib/elixir/lib
+(branch v1.20, Elixir 1.20.1, Erlang/OTP 28)
+================================================================================
+Scope: quoting/unquoting/hygiene (elixir_quote, elixir_dispatch, elixir_fn,
+Macro), expansion/scoping/env (elixir_expand, elixir_clauses, elixir_env,
+elixir_map, elixir_bitstring, elixir_aliases, elixir_import), Erlang codegen
+and evaluation order (elixir_erl_pass, elixir_erl_for, elixir_erl_try,
+elixir_erl_var, elixir_erl, elixir_rewrite), and compiler-facing stdlib
+(Kernel macros, elixir_def/elixir_module/elixir_overridable, Module,
+Protocol). Method: line-by-line review by four parallel auditors, every
+candidate verified by repro against the pristine in-repo build (bin/elixir);
+all repros below were then independently re-run and confirmed by the
+orchestrator. Only bugs triggerable by valid source code are listed — no
+handcrafted AST, no crash-on-invalid-code, no style nits. Type system
+(Module.Types) excluded — covered by the earlier BUGS_FABLE.txt audit.
+
+All repros assume: cd <repo> && bin/elixir repro.exs (or bin/elixir -e).
+
+================================================================================
+A. MISCOMPILATION — VALID CODE PRODUCES WRONG VALUES / WRONG EFFECT ORDER
+================================================================================
+
+--------------------------------------------------------------------------------
+A1. [HIGH][1.20 REGRESSION] Bitstring-generator comprehensions on the reduce
+    codegen path silently STOP instead of SKIP at non-matching fixed-size chunks
+    elixir_erl_for.erl:322-324 (no_var_size/1), used by no_var/2 and
+    build_reduce_each/5 (bin clause, lines 258-295)
+    https://github.com/elixir-lang/elixir/issues/15460
+--------------------------------------------------------------------------------
+When a bitstring generator compiles through the reduce-based codegen (used for
+:uniq, :into %{}, :into MapSet.new(), :reduce, Collectable :into, and mixed
+enum+bin generators), the compiler emits an extra "skip" clause mirroring
+Erlang's native semantics: a fixed-size chunk that fails the pattern is
+skipped and iteration continues. Commit 8fdef5c48 ("Properly track variables
+inside comprehensions size, closes #15247", first in v1.20.0-rc.5) rewrote:
+
+    no_var_size({var, _, _}) -> throw(unbound_size);     % old
+    no_var_size(Size) -> Size.
+
+into:
+
+    no_var_size(default) -> default;
+    no_var_size(Size) when is_integer(Size) -> Size;     % DEAD CLAUSE
+    no_var_size(_) -> throw(unbound_size).
+
+`Size` is an Erlang abstract form (e.g. {integer, Anno, 8}), never a raw
+integer, so the is_integer/1 clause never matches. Every explicit size
+(x::8, x::size(8), and the implicit sizes of segments next to literal
+strings) now throws unbound_size, the skip clause is dropped, and on a value
+mismatch the catch-all `<<Tail::bitstring>> -> Acc` clause silently
+terminates the comprehension, dropping all remaining matching chunks. The
+native lc/bc fast path (no options, all-bin generators, :into list/binary)
+delegates to Erlang and skips correctly — so the SAME comprehension yields
+DIFFERENT results depending on options.
+
+Repro:
+    bin = <<0, 1, 9, 2, 0, 3>>
+    IO.inspect for(<<0::8, x::8 <- bin>>, do: x)
+    IO.inspect for(<<0::8, x::8 <- bin>>, uniq: true, do: x)
+    IO.inspect for(<<0::8, x::8 <- bin>>, into: %{}, do: {x, x})
+    r = for(<<0::8, x::8 <- bin>>, reduce: []) do acc -> [x | acc] end
+    IO.inspect r
+    IO.inspect for(<<"k=", v::8, ";" <- "k=1;k=2;j=9;k=3;">>, uniq: true, do: v - ?0)
+Observed (1.20.1):
+    [1, 3]
+    [1]
+    %{1 => 1}
+    [1]
+    [1, 2]
+Expected (and produced by 1.19 / by elixir_erl_for rebuilt with the old
+no_var_size): [1, 3] / [1, 3] / %{1 => 1, 3 => 3} / [3, 1] / [1, 2, 3] —
+matching the lc path and Erlang's own
+[X || <<0:8, X:8>> <= <<0,1,9,2,0,3>>] = [1,3].
+Fix sketch: accept literal abstract sizes:
+    no_var_size({integer, _, _} = Size) -> Size;
+
+--------------------------------------------------------------------------------
+A2. [NOT A BUG?] `[head | unquote_splicing(list)]` (splicing in cons-tail position)
+    silently builds an improper list for 1-element splices and emits bogus
+    `|/3` AST otherwise
+    elixir_quote.erl — do_quote_tail handles the splice as LEFT operand of `|`
+    (lines 493-499); a splice as the RIGHT operand falls into the generic call
+    clause and is spliced into the argument list of the `|` node itself
+--------------------------------------------------------------------------------
+Splicing into the tail of a cons changes the arity of the `|` AST node instead
+of becoming the tail. For a 1-element splice the result is {:|, [], [1, 2]},
+which evaluates to the improper list [1 | 2] — silent wrong value. For 0- or
+2+-element splices the generated AST is {:|, [], [1]} / {:|, [], [1, 2, 3]},
+which fails much later with a confusing "undefined function |/1" / "|/3".
+
+Repro:
+    l1 = [2]
+    ast1 = quote do: [1 | unquote_splicing(l1)]
+    IO.inspect(ast1)
+    IO.inspect(Code.eval_quoted(ast1) |> elem(0))
+Observed:
+    [{:|, [], [1, 2]}]
+    [1 | 2]                  # user wrote a proper-list cons, got improper list
+    # with l1 = [2, 3]: error: undefined function |/3
+Expected: splice as the tail — consistent with the supported left-side form
+`[unquote_splicing(l) | tail]` (quote_test.exs:202-213) — or the standard
+"unquote_splicing only works inside arguments and block contexts" error at
+quote time. No test covers right-side splicing.
+
+--------------------------------------------------------------------------------
+A3. [MEDIUM] tap/2, then/2, is_struct/2, is_exception/2 evaluate their
+    arguments RIGHT-TO-LEFT outside guards
+    kernel.ex:1404 (tap — bind_quoted binds fun before value),
+    kernel.ex:2836-2839 (then — expands to fun.(value); Erlang evaluates the
+    fun expression before the argument), kernel.ex:2664-2678 (is_struct/2 —
+    `case unquote(name)` wraps `case unquote(term)`), kernel.ex:2787-2801
+    (is_exception/2 — same shape)
+--------------------------------------------------------------------------------
+Elixir guarantees left-to-right evaluation, and these macros emulate plain
+function calls — yet they evaluate the second argument first. Every other
+arg-evaluating Kernel macro verified (put_in/update_in/get_and_update_in/
+pop_in/get_in, raise/2, reraise, in/2, |>, destructure, defguard-generated
+macros) is strictly left-to-right.
+
+Repro:
+    defmodule H do def log(t, v) do IO.puts("eval:#{t}"); v end end
+    tap(H.log(:value, 1), H.log(:fun, fn _ -> :ok end))
+    then(H.log(:value2, 1), H.log(:fun2, fn x -> x end))
+    is_struct(H.log(:term, %{}), H.log(:name, URI))
+Observed:
+    eval:fun     before eval:value
+    eval:fun2    before eval:value2
+    eval:name    before eval:term
+Expected: first argument evaluated before the second, as in a function call
+(and as `1 |> tap(...)` pipelines visibly imply).
+
+--------------------------------------------------------------------------------
+A4. [LOW/NOT A BUG?] destructure/2 with a cons pattern silently discards the tail
+    kernel.ex:4157-4161 — destructure/2 computes `length(left)` on the quoted
+    list, counting `b | c` as ONE element
+--------------------------------------------------------------------------------
+For `[a, b | c]` the quoted LHS list has length 2 (the cons node is the last
+element), so the right side is truncated to 2 elements via
+Kernel.Utils.destructure(right, 2) and the tail variable binds [].
+
+Repro:
+    destructure([a, b | c], [1, 2, 3, 4, 5])
+    IO.inspect({a, b, c})
+Observed: {1, 2, []}        (destructure([a | b], [1,2,3]) gives b == [])
+Expected per docs ("The left-hand side supports any expression you would use
+on the left-hand side of a match"): c == [3, 4, 5] — or a compile-time error
+rather than silently binding [].
+
+================================================================================
+B. VALID CODE REJECTED / COMPILER CRASHES ON VALID CODE
+================================================================================
+
+--------------------------------------------------------------------------------
+B1. [CLOSED, VALIDATION ADDED][1.18 REGRESSION] `quote` containing `unquote` no longer usable as a
+    match pattern or in a guard
+    elixir_quote.erl:349-353 (do_quote({unquote, Meta, [Expr]}, ...) emits a
+    runtime call to :elixir_quote.unquote/1 whenever validate=true, i.e. for
+    every quote), interacting with elixir_expand.erl:296-298
+    https://github.com/elixir-lang/elixir/issues/15461
+--------------------------------------------------------------------------------
+Commit cc68ad91c ("Add shallow validation when unquoting AST", #13950, 1.18)
+wraps every unquoted expression in a runtime validation call. Remote calls
+are illegal in match/guard contexts, so any quote containing unquote used as
+a pattern or guard no longer compiles. Tellingly, elixir_expand.erl:296-298
+deliberately SKIPS the outer validate_quote wrapper when E.context /= nil
+(match/guard) — clear intent to keep quote usable in matches — but the inner
+per-unquote wrappers get no such treatment. No changelog entry or test
+asserts the new error.
+
+Repro:
+    case quote(do: 5 + 1) do
+      quote(do: unquote(x) + 1) -> IO.inspect(x)
+      _ -> IO.puts("no match")
+    end
+Observed (1.20.1):
+    error: cannot invoke remote function :elixir_quote.unquote/1 inside a match
+(Guard version: `def f(ast, y) when ast == quote(do: unquote(y) + 1)` fails
+with the guard variant of the same error.)
+Expected: compiles and prints 5, as on Elixir 1.17.3 (verified against the
+official 1.17.3 release: the unquote becomes a pattern variable).
+
+--------------------------------------------------------------------------------
+B2. [CLOSED, NOT A BUG][1.18 REGRESSION] Valid variable unification across parallel match
+    patterns falsely rejected as "recursive variable definition"
+    elixir_clauses.erl:47-91 (store_cycles/3) and :98-153 (recur_cycles/8,
+    self-cycle check at 104-106), driven from parallel_match/4 (16-36)
+    https://github.com/elixir-lang/elixir/issues/15462
+--------------------------------------------------------------------------------
+For parallel patterns `pat1 = pat2` in match context, store_cycles records,
+for every variable written by one sibling, a dependency on the union of ALL
+other siblings' write-sets. If the SAME variable is bound by two siblings —
+plain unification, e.g. `v` in both `%{a: v}` and `%{b: v}` — the variable
+lands in its own DependsOn set, producing a self-edge, and recur_cycles
+unconditionally reports any self-edge as "defined in function of itself".
+The expander itself unifies the two occurrences correctly (same version via
+the already-overridden branch, elixir_expand.erl:419-424) — only the
+validation rejects it. Introduced with pattern cycle detection in v1.18
+(commit 860f485bd). The deliberately-rejected cases in
+expansion_test.exs:202-246 cover only genuine cycles (x = {:ok, x},
+{x, y} = {y, x}); leaf unification is untested and the message is factually
+wrong for it.
+
+Repro:
+    f = fn %{a: v} = %{b: v} -> v end
+    IO.inspect(f.(%{a: 1, b: 1}))
+    # also fails: fn {v, _} = {_, v} -> v end, and the same in case/def heads
+Observed:
+    error: recursive variable definition in patterns:
+        [%{a: v} = %{b: v}]
+        the variable "v" is defined in function of itself
+Expected: compiles; per the patterns-and-guards reference
+(patterns-and-guards.md:66) "If the same variable appears multiple times in
+the same pattern, then all of them must be bound to the same value". The
+equivalent Erlang `fun(#{a := V} = #{b := V}) -> V end` compiles and unifies.
+Note the non-parallel forms `{x, x} = {1, 1}` and
+`{:ok, v} = {:ok, v} = {:ok, 1}` both work — only the parallel-pattern form
+is rejected.
+
+--------------------------------------------------------------------------------
+B3. [HIGH] Variable bound in one default argument leaks into a sibling
+    default, generating a dispatch clause with an unbound variable and
+    crashing compilation
+    elixir_def.erl:311-317 (expand_defaults/4)
+    https://github.com/elixir-lang/elixir/issues/15463
+--------------------------------------------------------------------------------
+expand_defaults threads the expansion state SE returned from one default
+expression into the expansion of the next sibling default. A variable bound
+inside the first default (`x = 1`) is therefore considered defined while
+expanding the second (`b \\ x`), so no "undefined variable" error is raised.
+unpack_expanded then generates the arity-1 dispatch clause
+`def f(x1), do: super(x1, x)` in which `x` is genuinely unbound; compilation
+blows up downstream (MatchError inside the type pass wrapped in RuntimeError;
+without the type pass the clause would be invalid Erlang anyway). The
+analogous cases are handled cleanly (def f(a, b \\ a), default referencing a
+module-body var, default-bound var used in body/guard all produce a proper
+"undefined variable" error) — only the sibling-default leak is broken.
+
+Repro (also crashes stock 1.20.1/OTP 28):
+    defmodule Repro do
+      def f(a \\ (x = 1), b \\ x), do: {a, b}
+    end
+Observed:
+    ** (RuntimeError) found error while checking types for Repro.f/1:
+    ** (MatchError) no match of right hand side value: %{vars: %{1 => %{name: :x1, ...
+    The exception happened while checking this code:
+    def f(x1) do
+      super(x1, x)
+    end
+Expected: a clean `undefined variable "x"` diagnostic pointing at `b \\ x`;
+each default must be expanded without bindings leaked from sibling defaults.
+
+--------------------------------------------------------------------------------
+B4. [LOW] Internal `CompileError: unbound variable '_len@2'` when a
+    bitstring size variable is rebound earlier in the same pattern OUTSIDE
+    the binary
+    elixir_expand.erl:451-468 (bitsize prematch branch of var expansion),
+    set up by expand_spec_arg/4 in elixir_bitstring.erl:288-294
+    https://github.com/elixir-lang/elixir/issues/15479
+--------------------------------------------------------------------------------
+Inside size(...) of a binary match, the first condition
+`map_get(Pair, Pre) /= CurrentVersion -> {ok, CurrentVersion}` accepts the
+variable whenever it exists pre-match but was rebound inside the current
+pattern, resolving the size to the in-pattern version. When that rebinding
+happened outside the binary (e.g. a sibling tuple element), the Erlang
+backend cannot reference it in a size position (Erlang forbids it), so the
+expander emits AST the backend rejects — an opaque internal error with a
+mangled variable name and no source location. Inconsistent with the
+rebound-AFTER-the-binary case, which warns (unpinned_bitsize_var) and uses
+the pre-match value. Pre-existing in 1.19.5; the related unpinned-var path
+was promoted to an active deprecation warning in 1.20, making the
+inconsistency more visible.
+
+Repro:
+    len = 4
+    {len, <<x::size(len), _::bitstring>>} = {8, <<255, 0>>}
+    IO.inspect({len, x})
+    # same crash in fn/case heads with an outer `len` in scope
+Observed:
+    ** (CompileError) elixir_compiler_0: unbound variable '_len@2' in '__FILE__'/1
+        (stdlib 7.3) lists.erl:2641: :lists.foreach_1/2
+Expected: either a clean front-end error pointing at size(len) (as the docs
+promise for the un-prebound variant, special_forms.ex ~254-261), or
+resolution to the pre-match version with the unpinned_bitsize_var warning,
+consistent with the rebound-after case.
+
+--------------------------------------------------------------------------------
+B5. [MEDIUM] `defmodule unquote(mod).Sub` fails inside any module body with
+    "invalid value for option :as"
+    kernel.ex:5249-5258 (alias_defmodule, nested-alias clause); the AST shape
+    is deliberately produced by elixir_quote:dot/4 (elixir_quote.erl:531-532)
+--------------------------------------------------------------------------------
+`unquote(mod).Sub` inside quote produces {:__aliases__, meta,
+[:"Elixir.DM", :Inner]}. alias_defmodule's nested clause guard `is_atom(h)`
+matches the FULL module atom :"Elixir.DM", and
+String.to_atom("Elixir." <> Atom.to_string(h)) builds :"Elixir.Elixir.DM",
+which then fails `require ..., as:` validation. Works at the top level
+(different code path); fails inside any module body. Long-standing (also
+fails on 1.17.3).
+
+Repro (lib file + use file, bin/elixir -r lib.exs use.exs):
+    defmodule DM do
+      defmacro m do
+        quote do
+          defmodule unquote(__MODULE__).Inner do
+            def v, do: :inner_ok
+          end
+        end
+      end
+    end
+    # use file:
+    require DM
+    DM.m()                  # top level: works, defines DM.Inner
+    defmodule DMu do
+      require DM
+      DM.m()                # module body: compile error
+    end
+Observed: top level prints :inner_ok; in the module body:
+    error: invalid value for option :as, expected a simple alias,
+    got nested alias: Elixir.DM
+Expected: defines DM.Inner, analogous to writing `defmodule __MODULE__.Inner`
+directly (which works because its raw AST head is not an atom and skips the
+nested-alias clause).
+
+--------------------------------------------------------------------------------
+B6. [LOW/NOT A BUG?] `unquote` in nested-quote OPTIONS: 2-arg form works, keyword-sugar
+    form silently emits dead code that errors at the call site
+    elixir_quote.erl:328-336 vs 338-347 — do_quote({quote, _, [Arg]}) quotes
+    the whole single keyword argument (options included) with unquote=false,
+    while do_quote({quote, _, [Opts, Arg]}) quotes Opts with unquoting enabled
+--------------------------------------------------------------------------------
+Repro:
+    l = 42
+    ast2 = quote do: quote([line: unquote(l)], do: foo())   # 2-arg form
+    IO.inspect(Code.eval_quoted(ast2) |> elem(0))           # works
+    ast1 = quote do: quote(line: unquote(l), do: foo())     # keyword sugar
+    IO.inspect(Code.eval_quoted(ast1) |> elem(0))
+Observed: 2-arg form yields {:foo, [line: 42], []}; the sugar form leaves
+{:unquote, [], [{:l, [], Elixir}]} in the options and the generated code
+fails with "error: unquote called outside quote" (plus a spurious "unused
+variable l" warning). Outside an enclosing quote both spellings are the same
+call. Since an inner quote can never evaluate unquote in its own options,
+the 2-arg behavior (outer quote consumes it) is the only useful semantics;
+the sugar form silently produces broken code. Long-standing; no test covers
+it.
+
+--------------------------------------------------------------------------------
+B7. [LOW/NOT A BUG] Macro.escape(term, unquote: true) crashes with FunctionClauseError
+    on improper lists whose proper segment contains unquote_splicing
+    elixir_quote.erl:226-236 (do_escape improper-list branch):
+    do_quote_splice returns a runtime-concat CALL tuple
+    ({{:., [], [:erlang, :++]}, [], [...]}) when the proper segment contains
+    a splice, but update_last/2 (647-649) only accepts lists
+--------------------------------------------------------------------------------
+Repro:
+    splice = quote unquote: false, do: unquote_splicing([2, 3])
+    Macro.escape([1, splice | 4], unquote: true)
+Observed:
+    ** (FunctionClauseError) no function clause matching in Macro.escape/2
+        (elixir 1.20.1) lib/macro.ex:918
+Control: the proper-list variant Macro.escape([1, splice, 4], unquote: true)
+works and evaluates to [1, 2, 3, 4]; quote itself supports the analogous
+[1, unquote_splicing(l) | 4].
+Expected: AST evaluating to [1, 2, 3 | 4] (or at worst a clean
+ArgumentError). Long-standing (same crash on 1.17.3, where the stacktrace
+points directly at :elixir_quote.update_last/2).
+
+================================================================================
+C. DIAGNOSTICS / METADATA CORRECTNESS
+================================================================================
+
+--------------------------------------------------------------------------------
+C1. [MEDIUM] `generated: true` still propagates into user macro arguments for
+    REMOTE macro calls, suppressing genuine warnings; and the internal
+    stop_generated meta key leaks into macro-visible AST for imported/local
+    calls
+    elixir_dispatch.erl:155 — dispatch_require calls Expander(Args, Caller)
+    WITHOUT stop_generated(Args), while dispatch_import (line 122) and
+    Macro.Env.wrap_expansion (macro/env.ex:661) both apply it
+--------------------------------------------------------------------------------
+Commit 67042e877 ("Stop propagating generated on macro arguments", #14696)
+missed the dispatch_require path. Result: a macro that wraps its argument in
+`quote generated: true` suppresses all warnings in the USER-supplied argument
+when the inner macro is dispatched as Mod.macro(...), but not when dispatched
+as an imported/local call.
+
+Repro: see audit notes — defmacro pass(x), do: x; wrap it via
+`quote generated: true do import GenMac; pass(unquote(arg)) end` vs
+`quote generated: true do require GenMac; GenMac.pass(unquote(arg)) end`,
+call both with arg = Integer.to_string(:atom).
+Observed: the "incompatible types given to Integer.to_string/1" warning is
+emitted for the import dispatch and NOT AT ALL for the remote dispatch.
+Removing generated: true makes the remote warning appear (control).
+Expected: both forms warn.
+Secondary defect (same commit): the internal `stop_generated: true` meta key
+is visible to imported/local macros in their argument metadata —
+defmacro meta_of(x) invoked as imported meta_of(1 + 2) sees
+meta == [stop_generated: true, line: ..., column: ...] and the key survives
+Macro.escape into persisted AST — while M.meta_of(1 + 2) sees clean meta.
+
+--------------------------------------------------------------------------------
+C2. [LOW] Non-literal sizes in bitstring generator patterns: reduce path stops
+    where Erlang (and the lc path) skips — same family as A1, pre-existing
+    elixir_erl_for.erl no_var_size/1 (throws on any non-literal size)
+--------------------------------------------------------------------------------
+Repro:
+    k = 8
+    bin = <<0, 1, 9, 2, 0, 3>>
+    IO.inspect for(<<0::8, x::size(^k) <- bin>>, do: x)             #=> [1, 3]
+    IO.inspect for(<<0::8, x::size(^k) <- bin>>, uniq: true, do: x) #=> [1]
+Observed: [1, 3] vs [1]. The size is an outer-bound variable, computable at
+runtime; Erlang's native comprehension skips. Pre-existing before 1.20 (the
+old code threw on {var,_,_} too), but it is the same valid expression
+producing different elements depending on :uniq/:into.
+
+--------------------------------------------------------------------------------
+C3. [TRIVIAL] Doubled "warning: warning:" prefix in @derive misuse warnings
+    module.ex:2000 and :2003 (check_derive/3) — messages hardcode a
+    "warning: " prefix and are passed to IO.warn/2, which adds its own
+--------------------------------------------------------------------------------
+Repro: a module with `@derive SomeProtocol` after defstruct (or without
+defstruct).
+Observed: "warning: warning: module attribute @derive was set after
+defstruct, ...". Present since 2022 (7c8d6ffb4).
+
+================================================================================
+D. NOTES (not runtime bugs, recorded to prevent bad "fixes")
+================================================================================
+
+D1. elixir_erl_pass.erl:720: the ?reorder table entry
+    ('Elixir.Kernel', put_elem, 2, [Tuple, Index, Term], erlang, element, ...)
+    declares arity 2 for the 3-ary put_elem and maps to erlang:element instead
+    of erlang:setelement. It can never match (put_elem/3 compiles to a plain
+    remote call, which is correct), so today it is only a missed optimization —
+    but fixing the arity alone would miscompile put_elem to erlang:element/3.
+    https://github.com/elixir-lang/elixir/pull/15480
+
+D2. Multiple @on_definition hooks run in reverse registration order while
+    @before_compile/@after_compile run in registration order. Undocumented
+    inconsistency; the reverse keeps the internal attribute-consuming callback
+    last, so it appears deliberate.
+    https://github.com/elixir-lang/elixir/issues/15481
+
+================================================================================
+AREAS VERIFIED CLEAN (high-level; each item exercised with side-effect or
+round-trip repros on bin/elixir)
+================================================================================
+- Hygiene core: var capture/leak, nested quotes, macro-defining-macros,
+  expansion counters, var!/var!(x, Mod), alias!, bind_quoted (shadowing,
+  eval-once, duplicate keys), import/alias hygiene and lazy resolution.
+- Macro.escape round-trips: improper/nested-improper lists, non-byte
+  bitstrings, maps with AST-shaped keys, fake __struct__ maps, -0.0,
+  external fun captures.
+- unquote_splicing in call args/def heads/tuples/maps/bitstrings/blocks and
+  left-of-| tails; location: :keep attribution.
+- Scoping: case/cond/receive/try/for/with leak rules, pin resolution in
+  parallel matches and binary generators, argument isolation, with-clause
+  threading vs else.
+- Evaluation order elsewhere: map literals/updates (duplicate keys: all
+  evaluated left-to-right, last wins), all other ?reorder rewrites
+  (evaluate_first preserves order), `in` orelse-chains, binary segment
+  construction, receive-after, |>, put_in/update_in/pop_in/get_and_update_in
+  paths (each segment once, left-to-right), raise/reraise, defguard outside
+  guards (declaration-order, eval-once), default-argument evaluation.
+- try/rescue normalization (badarith/badarg/badkey/undef, mixed aliases,
+  __STACKTRACE__ incl. nested-try restore), comprehension Collectable path
+  (halt/done ordering, re-raise class), struct codegen guards, module forms
+  (@on_load, @deprecated, persisted attribute order, behaviour_info,
+  MACRO- prefixed macrocallbacks).
+- defoverridable/super chains, defdelegate, protocol dispatch pre/post
+  consolidation across builtin types/structs/Any, @derive with __deriving__.
+================================================================================

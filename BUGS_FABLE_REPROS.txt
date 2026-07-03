@@ -1,0 +1,691 @@
+================================================================================
+REPRODUCERS FOR TRIAGED TYPESYSTEM FINDINGS
+================================================================================
+
+These are reduced repros for findings in BUGS_FABLE.txt that are reachable
+through either ordinary compiled Elixir source or through validish direct use of
+the internal Module.Types.Descr API.
+
+Run from the repository root with the local compiler:
+
+    cd /Users/lukaszsamson/elixir
+
+Compiler-reachable repros are stronger: they are normal Elixir modules/scripts
+that either crash the type checker or warn on code that demonstrably runs.
+Internal repros are weaker but still validish: they use public functions from
+the internal Module.Types.Descr module directly, which is enough to reproduce
+crashes or algebra bugs in code used by the checker.
+
+================================================================================
+1. COMPILER-REACHABLE CRASHES
+================================================================================
+
+--------------------------------------------------------------------------------
+1.1 A1: defimpl for an Erlang module crashes in Module.Types.Of.impl/2
+--------------------------------------------------------------------------------
+
+    tmp=$(mktemp -d /tmp/elixir-a1.XXXXXX)
+    cat > "$tmp/a1.ex" <<'EOF'
+    defprotocol P3 do
+      def go(x)
+    end
+
+    defimpl P3, for: :gen_server do
+      def go(x), do: x
+    end
+EOF
+    bin/elixirc -o "$tmp/ebin" "$tmp/a1.ex"
+
+Observed:
+
+    ** (UndefinedFunctionError) function :gen_server.__info__/1 is undefined
+        (elixir 1.20.0) lib/module/types/of.ex:294: Module.Types.Of.impl/2
+        (elixir 1.20.0) lib/module/types.ex:154: Module.Types.default_domain/4
+
+Why this is valid code: protocol implementations for Erlang modules are valid
+Elixir source. The type checker assumes every loaded `for:` target has
+`__info__/1`, but Erlang modules do not.
+
+Expected: compile, with the implementation domain treated as an open struct map
+for the protocol target or otherwise handled without calling `__info__/1`.
+
+--------------------------------------------------------------------------------
+1.2 A2: applying a statically empty function type crashes fun_normalize/2
+--------------------------------------------------------------------------------
+
+    tmp=$(mktemp -d /tmp/elixir-a2.XXXXXX)
+    cat > "$tmp/a2.ex" <<'EOF'
+    defmodule CrashBadfun do
+      def go(), do: :erlang.error(:foo).(1)
+    end
+EOF
+    bin/elixirc -o "$tmp/ebin" "$tmp/a2.ex"
+
+Observed:
+
+    ** (RuntimeError) found error while checking types for CrashBadfun.go/0:
+    ** (FunctionClauseError) no function clause matching in
+       Module.Types.Descr.fun_normalize/2
+        (elixir 1.20.0) lib/module/types/descr.ex:1609:
+        Module.Types.Descr.fun_normalize(nil, 1)
+
+Why this is validish code: `:erlang.error(:foo)` has type none(), and applying
+the result is syntactically valid Elixir that should produce a bad-function
+diagnostic or be ignored, never crash the checker.
+
+Expected: a type diagnostic about applying a non-function/empty function type,
+not an internal checker crash.
+
+================================================================================
+2. COMPILER-REACHABLE FALSE POSITIVES
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1 B4: bound variables inside binary patterns are treated as fresh
+--------------------------------------------------------------------------------
+
+    tmp=$(mktemp -d /tmp/elixir-b4.XXXXXX)
+    cat > "$tmp/b4.exs" <<'EOF'
+    defmodule TRedundant do
+      def f(x, <<x::binary>>), do: 1
+      def f(a, b) when is_binary(a) and is_binary(b), do: 2
+    end
+
+    IO.inspect(TRedundant.f("a", "b"), label: :runtime)
+EOF
+    bin/elixir "$tmp/b4.exs"
+
+Observed runtime:
+
+    runtime: 2
+
+Observed warning:
+
+    warning: the following clause is redundant:
+
+        def f(a, b) when is_binary(a) and is_binary(b)
+
+Why the warning is wrong: the first clause requires the second argument to be
+the same binary as the first argument. `TRedundant.f("a", "b")` reaches the
+second clause, so it is not redundant.
+
+--------------------------------------------------------------------------------
+2.2 B5: binary/bytes segments ignore the unit modifier
+--------------------------------------------------------------------------------
+
+Pattern/refinement repro:
+
+    tmp=$(mktemp -d /tmp/elixir-b5a.XXXXXX)
+    cat > "$tmp/b5a.exs" <<'EOF'
+    defmodule TBinaryUnitMatch do
+      def h(<<n::4>> = b) do
+        case b do
+          <<x::binary-size(1)-unit(4)>> -> {n, x}
+          _ -> :no
+        end
+      end
+    end
+
+    IO.inspect(TBinaryUnitMatch.h(<<5::4>>), label: :runtime)
+EOF
+    bin/elixir "$tmp/b5a.exs"
+
+Observed runtime:
+
+    runtime: {5, <<5::size(4)>>}
+
+Observed warning:
+
+    warning: the following clause will never match:
+
+        <<x::binary-unit(4)-size(1)>> ->
+
+    because it attempts to match on the result of:
+
+        b
+
+    which has type:
+
+        bitstring() and not binary()
+
+Why the warning is wrong: `binary-size(1)-unit(4)` is a 4-bit sub-bitstring
+segment. It is permitted by Elixir's bitstring syntax and matches the 4-bit
+value at runtime.
+
+Construction repro:
+
+    tmp=$(mktemp -d /tmp/elixir-b5b.XXXXXX)
+    cat > "$tmp/b5b.exs" <<'EOF'
+    defmodule TBinaryUnitConstruct do
+      def make() do
+        x = <<7::3>>
+        <<x::binary-size(3)-unit(1)>>
+      end
+    end
+
+    IO.inspect(TBinaryUnitConstruct.make(), label: :runtime)
+EOF
+    bin/elixir "$tmp/b5b.exs"
+
+Observed runtime:
+
+    runtime: <<7::size(3)>>
+
+Observed warning:
+
+    warning: incompatible types in binary construction:
+
+        <<x::binary-unit(1)-size(3)>>
+
+    got type:
+
+        bitstring() and not binary()
+
+    but expected type:
+
+        binary()
+
+Inferred-domain repro:
+
+    tmp=$(mktemp -d /tmp/elixir-b5c.XXXXXX)
+    cat > "$tmp/b5c.exs" <<'EOF'
+    defmodule TBinaryUnitDomain do
+      def f(<<_x::binary-size(3)-unit(1)>>), do: :ok
+      def call(), do: f(<<7::3>>)
+    end
+
+    IO.inspect(TBinaryUnitDomain.call(), label: :runtime)
+EOF
+    bin/elixir "$tmp/b5c.exs"
+
+Observed runtime:
+
+    runtime: :ok
+
+Observed warning:
+
+    warning: incompatible types given to f/1:
+
+        f(<<7::integer-size(3)>>)
+
+    given types:
+
+        -bitstring() and not binary()-
+
+    but expected one of:
+
+        binary()
+
+--------------------------------------------------------------------------------
+2.3 B6: for-comprehension body refinements leak into surrounding scope
+--------------------------------------------------------------------------------
+
+    tmp=$(mktemp -d /tmp/elixir-b6.XXXXXX)
+    cat > "$tmp/b6.exs" <<'EOF'
+    defmodule TForLeak do
+      def fr(x, list) when is_atom(x) or is_integer(x) do
+        for _i <- list do
+          case x do
+            a when is_atom(a) -> a
+          end
+        end
+
+        x + 1
+      end
+    end
+
+    IO.inspect(TForLeak.fr(5, []), label: :runtime)
+EOF
+    bin/elixir "$tmp/b6.exs"
+
+Observed runtime:
+
+    runtime: 6
+
+Observed warning:
+
+    warning: incompatible types given to Kernel.+/2:
+
+        x + 1
+
+    given types:
+
+        -dynamic(atom())-, integer()
+
+Why the warning is wrong: the comprehension body executes zero times for an
+empty list, so its `case` cannot refine `x` after the comprehension. The call
+`TForLeak.fr(5, [])` is valid and returns 6.
+
+--------------------------------------------------------------------------------
+2.4 B7: hardcoded __info__(:struct) return type omits :required
+--------------------------------------------------------------------------------
+
+    tmp=$(mktemp -d /tmp/elixir-b7.XXXXXX)
+    cat > "$tmp/b7.exs" <<'EOF'
+    defmodule TStructInfo do
+      def required_key() do
+        [first | _] = URI.__info__(:struct)
+        Map.get(first, :required)
+      end
+    end
+
+    IO.inspect(TStructInfo.required_key(), label: :runtime)
+EOF
+    bin/elixir "$tmp/b7.exs"
+
+Observed runtime:
+
+    runtime: false
+
+Observed warning:
+
+    warning: incompatible types given to Map.get/2:
+
+        Map.get(first, :required)
+
+    the map:
+
+        %{default: if_set(term()), field: atom()}
+
+    does not have all required keys:
+
+        :required
+
+    therefore this function will always return nil
+
+Why the warning is wrong: `URI.__info__(:struct)` returns maps with a
+`:required` key. `Map.get(first, :required)` returns `false` for this input,
+not `nil`.
+
+================================================================================
+3. VALIDISH INTERNAL-API REPROS
+================================================================================
+
+These do not need malformed ASTs or private Erlang calls; they are ordinary
+Elixir scripts that import `Module.Types.Descr`. They are weaker than the
+compiler-reachable examples above because they call the checker algebra
+directly.
+
+--------------------------------------------------------------------------------
+3.1 A3: difference/2 stores a non-normalized empty dynamic part
+--------------------------------------------------------------------------------
+
+    bin/elixir -e 'import Module.Types.Descr; d = difference(dynamic(integer()), integer()); IO.inspect(d, label: :d); IO.inspect(negation(d), label: :neg)'
+
+Observed:
+
+    d: %{dynamic: %{}}
+    ** (BadMapError) expected a map, got:
+
+        :term
+
+        (elixir 1.20.0) lib/module/types/descr.ex:510:
+        Module.Types.Descr.difference/2
+
+Expected: `difference(dynamic(integer()), integer())` should normalize to
+none(), and `negation(none())` should return term().
+
+--------------------------------------------------------------------------------
+3.2 A4: to_quoted_string/1 crashes on mixed static/dynamic function unions
+--------------------------------------------------------------------------------
+
+Crash while printing:
+
+    bin/elixir -e 'import Module.Types.Descr; d = difference(fun([term()], atom()), fun([integer()], dynamic(atom()))); IO.puts(to_quoted_string(d))'
+
+Observed:
+
+    ** (FunctionClauseError) no function clause matching in
+       Module.Types.Descr.difference/3
+
+The first argument to `difference/3` is an integer arity key (`1`), which means
+function denormalization leaked raw function-BDD internals into the generic
+type printer.
+
+Silent wrong print:
+
+    bin/elixir -e 'import Module.Types.Descr; d = union(integer(), union(fun([integer()], atom()), dynamic(fun([integer()], atom())))); IO.puts(to_quoted_string(d))'
+
+Observed:
+
+    (integer() -> atom())
+
+Expected:
+
+    integer() or (integer() -> atom())
+
+Why this matters: `to_quoted_string/1` is used to render warning types. A type
+printer must not crash while formatting a checker diagnostic, and it must not
+drop non-function components from the displayed type.
+
+================================================================================
+4. ATTEMPTED BUT NOT CLAIMED AS SOURCE-REACHABLE HERE
+================================================================================
+
+The following BUGS_FABLE.txt findings have strong direct Descr API repros in
+the audit file, but I did not reduce them to compiler-reachable source warnings
+in this pass:
+
+  * B2 map_put/map_update rewriting negated BDD leaves
+  * B3 tuple_fetch on size lower bounds established by negations
+  * C1 list_tl under-approximation through negations
+  * C2 list(dynamic()) losing the static empty_list() component
+  * C3 @term_or_dynamic_optional dynamic part is not an upper bound
+  * C4 missing :bitstring map domain key
+  * C5 tuple_insert_at over pure-negative BDDs
+
+I tried straightforward clause-subtraction source shapes for B3 and C1; those
+did not emit a wrong compiler warning, likely because the source checker path
+widened before the affected operation. They should remain internal-algebra
+findings unless/until a real source-level warning or crash is reduced.
+
+================================================================================
+5. ADDITIONAL B/C/D VALIDISH CODE REPROS
+================================================================================
+
+The snippets below are executable Elixir code, but they exercise the checker
+through the internal `Module.Types.Descr` API rather than through ordinary
+compiled modules. I tried harder to force several of these through source-level
+clause subtraction and built-in calls; notes are included where those paths were
+masked by gradual widening or by call handlers that push expected types into
+the argument before invoking the affected operation.
+
+--------------------------------------------------------------------------------
+5.1 B1: map BDD one-key difference fast path [FIXED]
+--------------------------------------------------------------------------------
+
+The original reduced repro no longer fails on this checkout after the
+map-difference refactors/fixes in the #15433 era:
+
+    bin/elixir -e 'import Module.Types.Descr; a = open_map([a: atom([:x])]); b = closed_map([a: if_set(atom([:x]))]); IO.inspect(subtype?(opt_difference(a, b), a), label: :subtype)'
+
+Observed now:
+
+    subtype: true
+
+B1 is kept here only as a historical note; it is removed from the combined
+internal repro runner.
+
+--------------------------------------------------------------------------------
+5.2 B2: Map.put with broad atom key excludes reachable result maps
+--------------------------------------------------------------------------------
+
+    bin/elixir -e 'import Module.Types.Descr; d = difference(open_map(), empty_map()); {:ok, res} = map_put(d, atom(), atom([:x])); IO.puts(to_quoted_string(res)); IO.inspect(subtype?(closed_map(a: atom([:x])), res), label: :contains_a_x)'
+
+Observed:
+
+    map() and not %{atom() => :x}
+    contains_a_x: false
+
+Expected:
+
+    contains_a_x: true
+
+Runtime witness: with `m = %{a: :y}` and `k = :a`,
+`Map.put(m, k, :x) == %{a: :x}`.
+
+Source pressure tried:
+
+    defmodule TB2PutNegSource do
+      def only_a_x(%{a: :x}), do: :ok
+
+      def g(m, k) when is_map(m) and map_size(m) != 0 and is_atom(k) do
+        only_a_x(Map.put(m, k, :x))
+      end
+    end
+
+    TB2PutNegSource.g(%{a: :y}, :a)
+
+This runs and does not warn. The likely reason is that `k` and `m` are still
+gradual after guard refinement, so the bad static result is widened enough that
+the later compatibility check does not reject it. Replacing `k` with
+`String.to_atom("a")` gives a static `atom()` key, but `m` is still gradual.
+
+--------------------------------------------------------------------------------
+5.3 B3: tuple_fetch disagrees with an equal non-empty open tuple type
+--------------------------------------------------------------------------------
+
+    bin/elixir -e 'import Module.Types.Descr; t = difference(open_tuple([]), tuple([])); IO.inspect(equal?(t, open_tuple([term()])), label: :equal_to_non_empty); IO.inspect(tuple_fetch(t, 0), label: :fetch)'
+
+Observed:
+
+    equal_to_non_empty: true
+    fetch: :badindex
+
+Expected:
+
+    fetch: {false, :term}
+
+Source pressure tried:
+
+    defmodule TTupleFetchSize do
+      def f(t) when is_tuple(t) and tuple_size(t) != 0 do
+        elem(t, 0)
+      end
+    end
+
+    TTupleFetchSize.f({:ok})
+
+This runs and does not warn. `Kernel.elem/2` and `:erlang.element/2` first push
+an expected `open_tuple([...])` shape into the tuple argument, which avoids the
+raw `tuple_fetch(difference(open_tuple([]), tuple([])), 0)` call that exposes
+the bug.
+
+--------------------------------------------------------------------------------
+5.4 C1: list_tl under-approximates tails through negated list types
+--------------------------------------------------------------------------------
+
+    bin/elixir -e 'import Module.Types.Descr; t = difference(non_empty_list(atom()), non_empty_list(atom([:a]))); {:ok, tl} = list_tl(t); IO.inspect(subtype?(non_empty_list(atom([:a])), tl), label: :tail_contains_a_list)'
+
+Observed:
+
+    tail_contains_a_list: false
+
+Expected:
+
+    tail_contains_a_list: true
+
+Runtime witness: `[:b, :a]` belongs to
+`non_empty_list(atom()) \\ non_empty_list(:a)`, and `tl([:b, :a]) == [:a]`.
+
+Source pressure tried: a two-clause list function whose first clause removes
+`[:a | _]`, followed by `tl(list)` in the second clause. It ran without a
+warning; list-head guards and inferred list signatures are currently widened
+enough that the false-positive path did not surface.
+
+--------------------------------------------------------------------------------
+5.5 C2: list(dynamic()) misses the guaranteed empty list
+--------------------------------------------------------------------------------
+
+    bin/elixir -e 'import Module.Types.Descr; IO.inspect(subtype?(empty_list(), list(dynamic())), label: :empty_list_subtype)'
+
+Observed:
+
+    empty_list_subtype: false
+
+Expected:
+
+    empty_list_subtype: true
+
+This is not known to produce a source false positive by itself; it is a
+constructor invariant bug.
+
+--------------------------------------------------------------------------------
+5.6 C3: @term_or_dynamic_optional violates gradual upper-bound invariants
+--------------------------------------------------------------------------------
+
+    bin/elixir -e 'import Module.Types.Descr; t = union(term(), dynamic(not_set())); IO.inspect({subtype?(term(), t), subtype?(dynamic(integer()), term()), subtype?(dynamic(integer()), t), empty?(intersection(t, dynamic(integer())))}, label: :checks)'
+
+Observed:
+
+    checks: {true, true, false, true}
+
+Expected:
+
+    The first two `subtype?` checks imply the third by transitivity, and
+    `intersection(t, dynamic(integer()))` should not be empty.
+
+I did not find an ordinary source warning that depends on this exact optional
+descriptor shape in this pass.
+
+--------------------------------------------------------------------------------
+5.7 C4: open map with pid domains is not open to bitstring keys
+--------------------------------------------------------------------------------
+
+    bin/elixir -e 'import Module.Types.Descr; s = closed_map([{[:bitstring], atom([:x])}]); t = open_map([{[:pid], pid()}]); IO.inspect(subtype?(s, t), label: :bitstring_map_subtype)'
+
+Observed:
+
+    bitstring_map_subtype: false
+
+Expected:
+
+    bitstring_map_subtype: true
+
+Source pressure tried:
+
+    defmodule TC4BitstringDomain do
+      def add_pid_key(m) when is_map(m) do
+        Map.put(m, self(), self())
+      end
+
+      def call do
+        add_pid_key(%{<<1::1>> => :x})
+      end
+    end
+
+This runs and does not warn. The source path does produce a non-binary
+bitstring key, but I did not find a later source-level check that requires the
+specific `open_map([{[:pid], pid()}])` descriptor.
+
+--------------------------------------------------------------------------------
+5.8 C5: tuple_insert_at loses inserted element on pure-negative BDD paths
+--------------------------------------------------------------------------------
+
+    bin/elixir -e 'import Module.Types.Descr; t = difference(open_tuple([]), union(tuple([]), tuple([term()]))); inserted = tuple_insert_at(t, 2, float()); IO.inspect(equal?(t, open_tuple([term(), term()])), label: :equal_input); IO.puts(to_quoted_string(inserted)); IO.inspect(subtype?(tuple([integer(), integer(), atom()]), inserted), label: :allows_non_float_inserted_index)'
+
+Observed:
+
+    equal_input: true
+    {...} and not {term(), float()} and not {float()}
+    allows_non_float_inserted_index: true
+
+Expected:
+
+    The inserted index should be constrained to `float()`, so
+    `{integer(), integer(), atom()}` should not be a subtype of the result.
+
+Source pressure tried: `Tuple.insert_at/3` and `:erlang.insert_element/3`
+handlers push an expected minimum tuple length into the tuple argument before
+calling `tuple_insert_at`, so I did not get a source-level false positive.
+This bug is also an over-approximation in the observed direction, so it is more
+likely to miss warnings than to warn incorrectly.
+
+--------------------------------------------------------------------------------
+5.9 D1: keep_optional makes difference depend on representation of term()
+--------------------------------------------------------------------------------
+
+    bin/elixir -e 'import Module.Types.Descr; x = if_set(dynamic(integer())); term_map = union(integer(), negation(integer())); d1 = difference(x, term()); d2 = difference(x, term_map); IO.inspect({d1, d2, equal?(d1, d2)}, label: :diffs)'
+
+Observed:
+
+    diffs: {%{dynamic: %{optional: 1}}, %{dynamic: %{optional: 1}, optional: 1}, false}
+
+Expected:
+
+    `term_map` is equal to `term()`, so the two differences should be equal.
+
+--------------------------------------------------------------------------------
+5.10 D2: empty function at called arity reports badarity including that arity
+--------------------------------------------------------------------------------
+
+    bin/elixir -e 'import Module.Types.Descr; f = difference(fun([union(integer(), float())], atom()), fun([integer()], atom())); IO.inspect({empty?(f), fun_apply(f, [integer()])}, label: :apply)'
+
+Observed:
+
+    apply: {true, {:badarity, [1]}}
+
+Expected:
+
+    `:badfun` or an empty-function result. Reporting `{:badarity, [1]}` says
+    the function has arity 1 while rejecting a 1-arity call.
+
+--------------------------------------------------------------------------------
+5.11 D3: list_to_quoted prints negated non-empty list as list()
+--------------------------------------------------------------------------------
+
+    bin/elixir -e 'import Module.Types.Descr; d = difference(list(term()), non_empty_list(integer())); IO.inspect(subtype?(empty_list(), d), label: :contains_empty); IO.puts(to_quoted_string(d))'
+
+Observed:
+
+    contains_empty: true
+    list(term()) and not list(integer())
+
+Expected:
+
+    list(term()) and not non_empty_list(integer())
+
+The observed printed type denotes a different type because `not list(integer())`
+also excludes `[]`, while the actual descriptor still contains `[]`.
+
+--------------------------------------------------------------------------------
+5.12 D4: list_of(dynamic()) violates its documented empty-list flag
+--------------------------------------------------------------------------------
+
+    bin/elixir -e 'import Module.Types.Descr; IO.inspect(list_of(dynamic()), label: :list_of_dynamic)'
+
+Observed:
+
+    list_of_dynamic: {false, %{dynamic: :term}}
+
+Expected:
+
+    `{true, dynamic()}` because `dynamic()` can include `[]`.
+
+--------------------------------------------------------------------------------
+5.13 D5: :maps.values badmap copy-paste is source-hidden today
+--------------------------------------------------------------------------------
+
+Source probe:
+
+    tmp=$(mktemp -d /tmp/elixir-d5.XXXXXX)
+    cat > "$tmp/d5.exs" <<'EOF'
+    defmodule TD5MapsValues do
+      def f, do: :maps.values(1)
+    end
+EOF
+    bin/elixir "$tmp/d5.exs"
+
+Observed warning:
+
+    warning: incompatible types given to Map.values/1:
+
+        Map.values(1)
+
+The `apply.ex` badmap tuple for this path is built with `:maps.keys`, but the
+rendered diagnostic currently takes the displayed MFA from the call AST, so the
+copy-paste bug is not source-observable in this probe.
+
+--------------------------------------------------------------------------------
+5.14 D8: compatible_intersection succeeds where compatible? rejects
+--------------------------------------------------------------------------------
+
+    bin/elixir -e 'import Module.Types.Descr; IO.inspect({compatible?(none(), term()), compatible_intersection(none(), term())}, label: :empty); bad = %{dynamic: %{}}; IO.inspect({compatible?(bad, term()), compatible_intersection(bad, term())}, label: :bad_dynamic_empty)'
+
+Observed:
+
+    empty: {false, {:ok, %{}}}
+    bad_dynamic_empty: {false, {:ok, %{dynamic: %{}}}}
+
+Expected:
+
+    If `compatible?/2` rejects a pair, `compatible_intersection/2` should return
+    `{:error, left}` rather than `{:ok, none()}`. The docstring for
+    `compatible_intersection/2` says it returns an intersection only if the types
+    are compatible.
+
+Impact:
+
+    Narrow internal inconsistency. The repro is uninhabited/dead-code on the
+    left, so it is not a direct source-level false positive by itself, but it
+    violates the predicate/helper contract and breaks compatibility laws.

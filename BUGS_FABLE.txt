@@ -1,0 +1,935 @@
+================================================================================
+TYPE SYSTEM AUDIT — lib/elixir/lib/module/types (branch v1.20, 853b7cd71)
+================================================================================
+Scope: descr.ex, apply.ex, pattern.ex, expr.ex, of.ex, helpers.ex, traverse.ex,
+types.ex, traverse.ex. Method: line-by-line review by parallel auditors plus
+randomized property fuzzing of the Descr algebra (~200k law checks across
+multiple seeds and harnesses: membership oracles, algebraic identities,
+subtype?/empty?/equal? consistency). Every finding below was re-verified by
+hand against the pristine local build (bin/elixir, 1.20.0). False negatives
+(missing warnings / over-approximation) are excluded by request.
+
+All repros below assume: cd <repo> && bin/elixir -e '...' with
+`import Module.Types.Descr`, or bin/elixirc for compile repros.
+
+================================================================================
+A. COMPILER CRASHES ON VALID CODE
+================================================================================
+
+--------------------------------------------------------------------------------
+A1. [LOW] `defimpl ... for: <Erlang module>` crashes the type checker
+    of.ex:294 (clause 289-299); reached via types.ex:154 (default_domain/4);
+    also reachable from the {:impl, for} hint in helpers.ex:116
+--------------------------------------------------------------------------------
+`Module.Types.Of.impl/2` does
+    mode == :closed && Code.ensure_loaded?(struct) && struct.__info__(:struct)
+without checking `function_exported?(struct, :__info__, 1)`. The parallel code
+in `struct_info/5` (of.ex:505) has the guard; this clause does not. Any loaded
+module that does not export __info__/1 (i.e. every Erlang module) crashes
+compilation. The crash happens inside Module.Types.infer/7, OUTSIDE the
+internal_error! try/rescue, so it aborts compilation with a raw exception.
+
+Repro (compiles on 1.18; crashes here):
+    defprotocol P3, do: def go(x)
+    defimpl P3, for: :gen_server do
+      def go(x), do: x
+    end
+Observed:
+    == Compilation error ==
+    ** (UndefinedFunctionError) function :gen_server.__info__/1 is undefined
+        Module.Types.Of.impl/2 (of.ex:294)
+        Module.Types.default_domain/4 (types.ex:154)
+Expected: compiles; non-struct `for:` should fall back to
+open_map(__struct__: atom([module])) (as `defimpl P3, for: Enum` does).
+
+--------------------------------------------------------------------------------
+A2. [FIXED] fun_apply on a static empty function type crashes
+    descr.ex:1563-1573 (fun_normalize_both/3); fun_normalize/2 at 1613-1633
+    https://github.com/elixir-lang/elixir/issues/15486
+--------------------------------------------------------------------------------
+When the static part normalizes to :badfun and there is no dynamic part
+(fun_dynamic == nil), the :badfun branch calls fun_normalize(nil, arity),
+which matches no clause. Also reachable when fun_only?(%{}) is true for the
+empty descr none(), reaching fun_apply machinery with no :fun key.
+
+API repro:
+    fun_apply(none(), [integer()])
+    # ** (FunctionClauseError) ... Module.Types.Descr.fun_normalize/2
+Real-compile repro (a none()-typed callee):
+    defmodule Crash do
+      def go(), do: :erlang.error(:foo).(1)
+    end
+Observed: compilation aborts with
+    ** (RuntimeError) found error while checking types for Crash.go/0:
+    ** (FunctionClauseError) no function clause matching in
+       Module.Types.Descr.fun_normalize/2 ... Please report this bug
+Expected: a :badfun diagnostic (as happens when the same type is
+dynamic-wrapped), never a checker crash.
+
+--------------------------------------------------------------------------------
+A3. [HIGH] difference/2 produces non-normalized empty dynamic `%{dynamic: %{}}`;
+    later negation/difference from term() raises BadMapError
+    descr.ex:504-514 (gradual difference branch, Map.put at :510);
+    interacting clause difference_static at :517
+    https://github.com/elixir-lang/elixir/issues/15487
+--------------------------------------------------------------------------------
+In the gradual branch, dynamic_part = difference_static(left_dynamic,
+right_static) can be %{} and is stored unconditionally, e.g.
+difference(dynamic(integer()), integer()) == %{dynamic: %{}} — a
+non-normalized representation of none(). When such a value later appears on
+the right of difference with :term on the left (e.g. via negation/1, :586),
+difference_static(:term, %{}) returns the bare atom :term and line 510
+executes Map.put(:term, :dynamic, :term).
+
+Repro:
+    d = difference(dynamic(integer()), integer())
+    # => %{dynamic: %{}}
+    negation(d)
+    # ** (BadMapError) expected a map, got: :term   (descr.ex:510)
+Expected: negation(none()) == term().
+Such descrs circulate in practice: fun_apply(dynamic(fun([integer()],
+none())), [integer()]) returns {:ok, %{dynamic: %{}}}. Fuzzer hit this in
+485/20000 random compositions of public ops.
+
+--------------------------------------------------------------------------------
+A4. [LOW] to_quoted_string crashes (or silently corrupts the printed type)
+    on unions of static and dynamic fun types
+    descr.ex:1945-1962 (fun_denormalize/3 first clause), consumer at :757-758
+    https://github.com/elixir-lang/elixir/issues/15523
+--------------------------------------------------------------------------------
+fun_denormalize's reduce is seeded with the raw inner fun representations
+{static_repr, dynamic_repr, []} (maps of arity => bdd) while the caller
+(non_term_type_to_quoted, which computes difference(dynamic, static)) expects
+full descrs. Two consequences:
+
+(a) CRASH whenever any arity fails to denormalize — leftover integer keys
+    reach difference/2 which iterates them as descr kind keys:
+    to_quoted_string(difference(fun([term()], atom()),
+                                fun([integer()], dynamic(atom()))))
+    # ** (FunctionClauseError) no function clause matching in
+    #    Module.Types.Descr.difference/3 (first arg = 1, an arity)
+    This fires whenever the checker tries to *display* such a type in a
+    warning — printing a valid type must never raise.
+
+(b) SILENT TYPE CORRUPTION when denormalization succeeds — all non-fun
+    components of both descrs are dropped from the printout:
+    to_quoted_string(union(integer(),
+        union(fun([integer()], atom()), dynamic(fun([integer()], atom())))))
+    # observed: "(integer() -> atom())"
+    # expected: "integer() or (integer() -> atom())"
+    to_quoted_string renders every type warning, so affected warnings print
+    a wrong type.
+
+================================================================================
+B. FALSE POSITIVES — WARNINGS EMITTED ON CORRECT CODE
+================================================================================
+
+--------------------------------------------------------------------------------
+B1. [FIXED] Map difference: one-key "fast path" builds an unsound union leaf;
+    subtype?/equal?/empty? wrong in BOTH directions on map types with negations
+    descr.ex:3094-3116 (map_leaf_difference single-key open-negative clause)
+    + 3134-3160 (map_leaf_one_key_difference :union arm at 3147-3148),
+    consumed by bdd_difference at 6298-6320
+    (found independently by 3 auditors + the fuzzer)
+    https://github.com/elixir-lang/elixir/issues/15507
+--------------------------------------------------------------------------------
+bdd_difference computes node \ leaf using a {:one_key_difference, a_diff,
+a_union} hint and relies on a_union being EXACTLY a1 ∪ a2 (the dual branch is
+D1 \ a_union, valid because ¬a1 ∧ D1 ∧ ¬a2 = D1 \ (a1 ∪ a2)). The
+map_difference_strategy path (4613+) only emits the hint when both literals
+share tag and all other fields — correct. But the fast path at :3094 fires for
+ANY positive literal vs an open single-key negative, including closed or
+domain-tagged positives and open positives with extra fields. There
+a_union ⊊ a1 ∪ a2, so the computed difference is TOO LARGE: it contains maps
+belonging to the subtrahend, and dually subtype? returns false for true
+relations.
+
+Repros (all static types):
+    a = open_map([a: atom([:x])]); b = closed_map([a: if_set(atom([:x]))])
+    subtype?(difference(a, b), a)              # => false; must be true (a\b ⊆ a)
+
+    a = open_map([c: integer()])
+    b = negation(open_map([b: integer(), c: union(integer(), float())]))
+    subtype?(intersection(a, b), a)            # => false; X ∧ Y ⊆ X universally
+
+    a = closed_map(b: atom([:x, :y]), c: pid())
+    b = closed_map(b: if_set(union(atom([:y]), float())),
+                   c: union(pid(), union(binary(), integer())))
+    c = open_map(c: if_set(union(pid(), binary())))
+    subtype?(a, c)                             # => true
+    empty?(difference(difference(a, b), c))    # => false; must be true (a ⊆ c)
+
+Key-name dependent (BDD ordering): ~45% of random atom-key pairs fail.
+Impact: subtype? wrongly false => spurious type errors downstream (map BDDs
+with negations arise from clause/pattern subtraction); empty? wrongly false
+for genuinely empty intersections; also misses warnings (the allowed
+direction). Root cause verified experimentally: guarding the :union arm to
+the exact-shape case (tag == :open and other fields equal) eliminates all
+~30 distinct fuzzer violations (30k membership checks + 8k identity checks
+go green) with the rest of the suite unaffected.
+
+Current checkout note: the reduced repro now passes after the map-difference
+refactors/fixes in the #15433 era:
+
+    a = open_map([a: atom([:x])])
+    b = closed_map([a: if_set(atom([:x]))])
+    subtype?(opt_difference(a, b), a)          # => true
+
+--------------------------------------------------------------------------------
+B2. [HIGH] map_put/map_update rewrite NEGATED BDD leaves, producing result
+    types that exclude achievable runtime values
+    descr.ex:4059-4099 (map_update_put_domains / map_update_put_domain),
+    reached from map_put_static (:4172) and map_update_static (:3816)
+    https://github.com/elixir-lang/elixir/issues/15509
+--------------------------------------------------------------------------------
+The domain-put transformation is applied via bdd_map, which rewrites EVERY
+leaf label — including leaves in negated position. Rewriting ¬N into ¬put(N)
+enlarges the negated set, so the result type wrongly excludes maps the
+runtime operation can produce. The design comment at 4036-4058 ("a negation
+will not remove any type from a domain unless it completely cancels out the
+type") is disproven by:
+
+(a) negated :closed leaf (4075-4081): ¬empty_map() becomes ¬%{atom() => :x}:
+    d = difference(open_map(), empty_map())
+    {:ok, res} = map_put(d, atom(), atom([:x]))   # Map.put(m, key::atom(), :x)
+    to_quoted_string(res)   # "map() and not %{atom() => :x}"
+    subtype?(closed_map(a: atom([:x])), res)      # => false; must be true:
+    # Map.put(%{a: :anything}, :a, :x) == %{a: :x} and %{a: :anything} ∈ d
+
+(b) domains-list negation (4085-4097):
+    d = difference(open_map([{domain_key(:integer), atom()}]),
+                   closed_map([{domain_key(:integer), atom([:y])}]))
+    {:ok, res} = map_put(d, integer(), atom([:y]))
+    x = difference(closed_map([{domain_key(:integer), atom([:y])}]), empty_map())
+    empty?(intersection(x, res))   # => true; every achievable result
+    # (e.g. Map.put(%{1 => :z}, 1, :y) == %{1 => :y}) is excluded
+Same through map_update/5 and the dynamic paths. Result types narrower than
+reality are the false-positive direction. Independent of B1 (persists with B1
+patched out).
+
+--------------------------------------------------------------------------------
+B3. [HIGH] tuple_fetch returns :badindex for always-valid accesses when the
+    size lower bound is established by negations
+    descr.ex: decision at 5538; root causes at 5599-5605
+    (tuple_pair_projection_keeps_full_fst? shortcut), 5707
+    (tuple_take_element -> term_or_optional() for short open positives),
+    5717 (tuple_tag_to_type(:closed) -> none())
+    https://github.com/elixir-lang/elixir/issues/15491
+--------------------------------------------------------------------------------
+For a DNF line whose positive is an open tuple shorter than the index, the
+projected element carries the :optional marker (term_or_optional()).
+Negations that remove exactly the small-arity tuples (where the index would
+be absent) can never cancel the marker: closed negatives shorter than the
+index project to none(), so they are treated as non-constraining. The
+leftover :optional flag then trips `static_optional? or empty?(static_type)`
+at :5538 => :badindex.
+
+Repro:
+    t = difference(open_tuple([]), tuple([]))   # all tuples of size >= 1
+    equal?(t, open_tuple([term()]))             # => true
+    tuple_fetch(t, 0)                           # => :badindex  (WRONG)
+    tuple_fetch(open_tuple([term()]), 0)        # => {false, :term}
+Equivalent minimal form via intersection (auto-shrunk by descr_model.exs,
+2026-07-03; verified):
+    t = opt_intersection(opt_negation(tuple([])), tuple())
+    equal?(t, open_tuple([term()]))             # => true
+    tuple_fetch(t, 0)                           # => :badindex  (WRONG)
+tuple_fetch is not a congruence wrt equal?. Also fails for
+difference(open_tuple([integer()]), tuple([integer()])) at index 1, etc.
+Impact: elem/2 (and any tuple_fetch consumer) raises a spurious type error
+on such static types; negated tuple types arise from clause subtraction.
+
+--------------------------------------------------------------------------------
+B4. [MEDIUM] Redundant-clause false positive: bound variables inside binary
+    patterns are treated as fresh
+    pattern.ex:990-995 (of_precise_bitstring?), used at :791
+    https://github.com/elixir-lang/elixir/issues/15455
+--------------------------------------------------------------------------------
+A clause is marked `precise?` (and its full type recorded for subsumption of
+later clauses) only if its patterns are "precise". For a bare variable
+pattern, precision correctly requires freshness (line 817 checks
+`not is_map_key(context.vars, version)`), so `def f(x, x)` is imprecise. But
+of_precise_bitstring?/1 returns true for `<<x::binary>>` based only on
+is_var(expr), without consulting context.vars. When x is bound earlier in
+the head, `<<x::binary>>` matches only binaries EQUAL to x, yet the clause is
+recorded as covering `binary(), binary()`.
+
+Repro:
+    defmodule TRedundant do
+      def f(x, <<x::binary>>), do: 1
+      def f(a, b) when is_binary(a) and is_binary(b), do: 2
+    end
+Observed: warning "the following clause is redundant: def f(a, b) ...".
+Runtime: TRedundant.f("a", "b") == 2 — the clause is reachable.
+Control: `def f(x, x)` + same second clause compiles clean, confirming the
+missing freshness check in the bitstring path is the cause.
+
+--------------------------------------------------------------------------------
+B5. [MEDIUM] binary/bytes segments ignore the `unit` modifier: typed binary()
+    and byte-aligned regardless of unit => multiple false-positive classes
+    of.ex:663-664 (specifier_type returns {@binary, :aligned} for
+    :binary/:bytes unconditionally); of.ex:619-621 (:aligned -> {0, context}
+    skips size*unit alignment); reached from pattern.ex:788
+    (found independently by 2 auditors)
+    https://github.com/elixir-lang/elixir/issues/15465
+--------------------------------------------------------------------------------
+elixir_bitstring.erl permits unit 1..256 on binary/bytes segments (only
+bitstring is pinned to unit 1). With size*unit not a multiple of 8 the
+segment value is a sub-bitstring (NOT a binary) and the segment is not
+byte-aligned. of.ex hardcodes value type binary() and alignment 0. Three
+verified false-positive classes (all run correctly at runtime):
+
+(1) match refinement / never-match:
+    def h(<<n::4>> = b) do
+      case b do
+        <<x::binary-size(1)-unit(4)>> -> {n, x}
+        _ -> :no
+      end
+    end
+    # warning: "the following clause will never match ... which has type:
+    #  bitstring() and not binary()"
+    # runtime: h(<<5::4>>) == {5, <<5::size(4)>>}
+(2) construction: x = <<7::3>>; <<x::binary-size(3)-unit(1)>>
+    # warning: incompatible types in binary construction (got bitstring()
+    #  and not binary() but expected binary()); runtime: <<7::size(3)>>
+(3) inferred domain: def f(<<_x::binary-size(3)-unit(1)>>), do: :ok
+    then f(<<7::3>>) warns "expected one of: binary()"; runtime: :ok
+Expected: when size*unit is not a multiple of 8 the type should be
+bitstring() with alignment size*unit (as already done for bits/bitstring
+segments). (Note: the "unit comes before size" assumption in specifier_size
+is safe — elixir_bitstring.erl normalizes the order before typing.)
+
+--------------------------------------------------------------------------------
+B6. [BY DESIGN/WONT FIX] `for` comprehensions leak variable refinements from
+    conditionally-executed code into the surrounding scope
+    expr.ex:594-642 (of_expr({:for, ...}))
+    https://github.com/elixir-lang/elixir/issues/15451
+--------------------------------------------------------------------------------
+Every other zero-or-more-times construct resets vars afterwards: cond (:380),
+receive (:584), case/fn bodies via of_clauses_fun (:993), with do-block
+(:653). The for handler threads the generator/filter context (:597) and both
+the reduce: (:607) and into: (:615-637) branches return the body-typing
+context directly. Refinements established in the body / filters /
+second-and-later generators (which may execute zero times) persist after the
+comprehension.
+
+Repro:
+    defmodule TFor do
+      def fr(x, list) when is_atom(x) or is_integer(x) do
+        for _i <- list do
+          case x do
+            a when is_atom(a) -> a
+          end
+        end
+        x + 1
+      end
+    end
+Observed: warning "incompatible types given to Kernel.+/2 ... given types:
+dynamic(atom()), integer()" (x narrowed by the case INSIDE the body).
+Runtime: TFor.fr(5, []) == 6. Confirmed variants: refinement via a filter,
+via a second generator's RHS, and in the reduce: branch; identical code with
+Enum.each(list, fn ...) compiles silently.
+Fix note (validated, then reverted): a blanket Of.reset_vars at the end
+removes all five false positives but fails 3 existing expr_tests that rely
+on refinements from ALWAYS-evaluated parts (first generator RHS, reduce
+init); the fix must reset only body/filter/later-generator refinements.
+
+--------------------------------------------------------------------------------
+B7. [FIXED] Stale hardcoded __info__(:struct) signature: missing :required
+    apply.ex:41 (struct_info = list(closed_map(default: ..., field: ...)))
+    https://github.com/elixir-lang/elixir/issues/15452
+--------------------------------------------------------------------------------
+Runtime struct-info maps have carried a :required key since commit a5b9c5b5d
+(2025-07, #14616), and Module's @callback __info__(:struct) documents
+optional(:required) => boolean(). The hardcoded CLOSED map (used at :59/:65
+for the __info__/1 :struct clause) predates it and was never updated.
+
+Repro:
+    [first | _] = URI.__info__(:struct)
+    Map.get(first, :required)
+Observed: warning "the map %{default: if_set(term()), field: atom()} does
+not have all required keys: :required — therefore this function will always
+return nil". Runtime: returns false (true for @enforce_keys fields) — the
+warning text is factually wrong. Map.fetch!(info, :required) similarly warns
+"will always raise" yet succeeds. The closed map also makes Map.get(info,
+:required, default) infer as always-default, cascading into unreachable-
+clause false positives in struct-reflection code.
+Fix: add required: if_set(boolean()).
+
+================================================================================
+C. SOUNDNESS / ALGEBRA BUGS (wrong types; false-positive enablers)
+================================================================================
+
+--------------------------------------------------------------------------------
+C1. [MEDIUM] list_tl under-approximates on list types with negations
+    descr.ex:2524-2536 (list_tl_static)
+    https://github.com/elixir-lang/elixir/issues/15490
+--------------------------------------------------------------------------------
+`initial` reuses the original BDD — including its NEGATIONS — as the list
+part of the tail type. But the tail of a value in nel(A) ∖ nel(B) may itself
+lie inside the negation.
+
+Repro:
+    t = difference(non_empty_list(atom()), non_empty_list(atom([:a])))
+    {:ok, tl} = list_tl(t)
+    subtype?(non_empty_list(atom([:a])), tl)   # => false; must be true:
+    # [:b, :a] ∈ t and tl([:b, :a]) == [:a]
+Simpler auto-shrunk repro (found independently by the finite-universe model,
+descr_model.exs, 2026-07-03; verified):
+    t = opt_difference(list(term()), list(atom()))
+    {:ok, tl} = list_tl(t)     # prints "list(term()) and not non_empty_list(atom())"
+    subtype?(non_empty_list(atom([:x])), tl)   # => false; must be true:
+    # [[], :x] ∈ t (the [] element is not an atom) and tl([[], :x]) == [:x]
+Result type narrower than reality = false-positive direction. Reachable from
+[h|t] destructuring (pattern.ex:505), Kernel.tl/1 (apply.ex:1089),
+expr.ex:101; negated list types arise from clause subtraction. Safe fix:
+rebuild the tail's list part from positive DNF leaves without negations.
+(list_hd is NOT affected.)
+
+--------------------------------------------------------------------------------
+C2. [FIXED] list(dynamic()) loses its static empty_list() component
+    descr.ex:2162-2163 (list_descr, `static_empty? -> %{dynamic: ...}` branch)
+    https://github.com/elixir-lang/elixir/issues/15488
+--------------------------------------------------------------------------------
+When the element (or tail) type is purely dynamic, the whole static part is
+dropped — including the @bit_empty_list requested via empty?: true. But []
+belongs to list(t) for EVERY materialization of t.
+
+Repro:
+    subtype?(empty_list(), list(dynamic()))                  # => false (wrong)
+    equal?(list(dynamic()),
+           union(empty_list(), non_empty_list(dynamic())))   # => false (wrong;
+    # that union is list/1's own definition, descr.ex:109-110)
+Same bug class as PR #15363 ("Preserve static parts in dynamic container
+descriptors"); this branch missed the empty? flag. Fix: return
+%{bitmap: @bit_empty_list, dynamic: dynamic_descr} when empty? is true.
+
+--------------------------------------------------------------------------------
+C3. [MEDIUM] @term_or_dynamic_optional has a dynamic part that is not an
+    upper bound, breaking subtype transitivity and intersections
+    descr.ex:80 (definition), :365 (optional_to_term); used by union/2
+    (:418-419) and dynamic_union (:2679-2680)
+    https://github.com/elixir-lang/elixir/issues/15497
+--------------------------------------------------------------------------------
+@term_or_dynamic_optional = Map.put(@term, :dynamic, %{optional: 1}) — the
+static part is term() but the :dynamic component is only not_set(),
+violating the documented invariant (descr.ex ~2664-2677: the dynamic
+component represents every value the gradual type can take). Should be
+Map.put(@term, :dynamic, @term_or_optional).
+
+Repro (t = union(term(), dynamic(not_set())), reachable when unioning map
+field types, e.g. union(term(), dynamic(if_set(integer())))):
+    subtype?(term(), t)                  # => true
+    subtype?(dynamic(integer()), term()) # => true
+    subtype?(dynamic(integer()), t)      # => false  (transitivity violated)
+    subtype?(dynamic(), t)               # => false  (wrong)
+    intersection(t, dynamic(integer()))  # => %{} i.e. none()  (wrong;
+                                         #    expected dynamic(integer()))
+Wrong-emptiness results of this kind are exactly what makes the checker warn
+on correct code.
+
+--------------------------------------------------------------------------------
+C4. [MEDIUM] :bitstring domain missing from @domain_key_types: open maps
+    with key domains wrongly REQUIRE non-binary-bitstring keys to be absent
+    descr.ex:43-46 (@domain_key_types lacks :bitstring) vs :2768-2781
+    (bitmap_to_domain_keys/domain_key_to_descr DO emit/accept :bitstring);
+    broken consumer: map_descr_static :2806-2823; also inconsistent
+    map_check_domain_keys?(:open, _) size check at :4531-4537
+    https://github.com/elixir-lang/elixir/issues/15515
+--------------------------------------------------------------------------------
+to_domain_keys produces :bitstring for non-binary bitstring key types
+(reachable: %{<<1::1>> => v} — of.ex:578-580 types <<1::1>> as
+bitstring_no_binary; map keys flow through of.ex:440 / apply.ex:1321). Closed
+maps with a :bitstring domain work, but when map_descr_static builds an OPEN
+map with domains it fills only the 11 @domain_key_types entries with
+term_or_optional(); the missing :bitstring domain then defaults to not_set()
+in lookups, i.e. the "open" map is not open in bitstring keys.
+
+Repro:
+    s = closed_map([{[:bitstring], atom([:x])}])
+    t = open_map([{[:pid], pid()}])
+    subtype?(s, t)                       # => false; must be true (t is open)
+    # control: same check with [:integer] or [:binary] domains => true
+Direction: type too narrow => potential false positives. Fix: add :bitstring
+to @domain_key_types (or stop emitting it) — the two halves currently
+disagree.
+
+--------------------------------------------------------------------------------
+C5. [MEDIUM] tuple_insert_at loses the inserted element on implicit
+    :bdd_top BDD paths
+    descr.ex:5924-5941 (tuple_insert_static via bdd_map); interacts with
+    tuple_difference(bdd_leaf(:open, []), bdd2) -> bdd_negation(bdd2) (:5073)
+    https://github.com/elixir-lang/elixir/issues/15517
+--------------------------------------------------------------------------------
+bdd_map rewrites only explicit literal leaves. When the positive part of the
+BDD is the implicit top (any type built as open_tuple([]) minus ..., whose
+BDD is a pure negation with :bdd_top branches), those paths never receive
+the inserted element, so the result does not constrain the inserted index.
+
+Repro (two equal? inputs, different results):
+    t2 = difference(open_tuple([]), union(tuple([]), tuple([term()])))
+    equal?(t2, open_tuple([term(), term()]))        # => true
+    to_quoted_string(tuple_insert_at(t2, 2, float()))
+    # => "{...} and not {term(), float()} and not {float()}"
+    subtype?(tuple([integer(), integer(), atom()]), tuple_insert_at(t2, 2, float()))
+    # => true   (index 2 must be float()!)
+    to_quoted_string(tuple_insert_at(open_tuple([term(), term()]), 2, float()))
+    # => "{term(), term(), float(), ...}"  (correct)
+Manifests as over-approximation (allowed direction) but the operation is not
+a congruence wrt equal? and the element layout is wrong.
+
+Smaller congruence pair (auto-shrunk by descr_fuzz's recipe shrinker,
+2026-07-03; verified — diverges for float() inserts too, so it is not a
+degenerate-none() artifact):
+    a  = open_tuple([term()])
+    a2 = opt_difference(term(), opt_difference(term(), a))   # negation-form BDD
+    equal?(a, a2)                                            # => true
+    equal?(tuple_insert_at(a, 1, float()),
+           tuple_insert_at(a2, 1, float()))                  # => false (also i=0)
+
+================================================================================
+D. MINOR / INTERNAL / DIAGNOSTICS
+================================================================================
+
+--------------------------------------------------------------------------------
+D1. [LOW] keep_optional/1 drops the static :optional flag when a dynamic
+    optional is present — difference/2 not extensional in its right argument
+    descr.ex:335-341 (first clause), reached from difference(left, :term)
+    (:501) and difference_static(left, :term) (:518)
+    https://github.com/elixir-lang/elixir/issues/15502
+--------------------------------------------------------------------------------
+For x = if_set(dynamic(integer())) (= %{dynamic: %{bitmap: 8, optional: 1},
+optional: 1}), the first clause returns only %{dynamic: %{optional: 1}},
+losing the static flag — but only on the :term fast path:
+    term_map = union(integer(), negation(integer()))
+    equal?(term_map, term())                          # => true
+    d1 = difference(x, term())     # %{dynamic: %{optional: 1}}
+    d2 = difference(x, term_map)   # %{dynamic: %{optional: 1}, optional: 1}
+    equal?(d1, d2)                                    # => false (wrong)
+The static/dynamic optional distinction is meaningful (descr_test.exs:986),
+so the fast path and the general path disagree.
+
+--------------------------------------------------------------------------------
+D2. [LOW] Function type that is empty at the called arity reports
+    {:badarity, [arity]} including the arity being called
+    descr.ex:1626-1633 (fun_normalize/2)
+    https://github.com/elixir-lang/elixir/issues/15521
+--------------------------------------------------------------------------------
+If the BDD at the requested arity exists but all DNF lines are empty
+(arrows == []), the result is {:badarity, :maps.keys(bdds)}:
+    f = difference(fun([union(integer(), float())], atom()),
+                   fun([integer()], atom()))
+    empty?(f)                  # => true
+    fun_apply(f, [integer()])  # => {:badarity, [1]}
+Downstream (apply.ex:1924) this renders as "expected a 1-arity function ...
+but got function with arity 1" — self-contradictory. Should be :badfun (or
+treated as empty).
+
+--------------------------------------------------------------------------------
+D3. [LOW] list_to_quoted prints negated leaves with the positive's
+    constructor name, rendering a semantically different type
+    descr.ex:2563-2576
+    https://github.com/elixir-lang/elixir/issues/15513
+--------------------------------------------------------------------------------
+Negated entries reuse the `name` computed for the positive literal. When the
+type contains [] (positive printed as `list`), negated leaves — which never
+contain [] — also print as list(...):
+    d = difference(list(term()), non_empty_list(integer()))
+    subtype?(empty_list(), d)   # => true ([] IS in the type)
+    to_quoted_string(d)         # => "list(term()) and not list(integer())"
+The printed expression denotes a type EXCLUDING []. Correct:
+"list(term()) and not non_empty_list(integer())". User-facing diagnostics
+show a wrong type.
+
+--------------------------------------------------------------------------------
+D4. [LOW, latent] list_of(dynamic()) reports empty_list?: false
+    descr.ex:2283-2288
+    https://github.com/elixir-lang/elixir/issues/15505
+--------------------------------------------------------------------------------
+The empty-list detection on the dynamic part matches only %{bitmap: ...} and
+misses dynamic == :term:
+    list_of(dynamic())   # => {false, dynamic()}; per the docstring (:2259)
+                         #    should be {true, dynamic()} — dynamic() admits []
+The single caller (apply.ex:1312, :maps.from_keys/2, which uses false to
+subtract empty_map() from the result) is currently shielded by its
+key_type == dynamic() early-exit, so the impact is latent — any new caller of
+the documented contract would compute non-empty-map results for possibly-
+empty lists.
+
+--------------------------------------------------------------------------------
+D5. [LOW] :maps.values badmap error built with the :maps.keys signature
+    apply.ex:1410
+    https://github.com/elixir-lang/elixir/pull/15526
+--------------------------------------------------------------------------------
+    defp remote_apply(:maps, :values, _info, [map], stack) do
+      ... :badmap -> {:error, badremote(:maps, :keys, [map])}   # copy-paste
+Invisible today only because the displayed MFA comes from the call AST and
+both signatures' domains are identical ([open_map()]); would print wrong
+expected clauses if they ever diverge.
+
+--------------------------------------------------------------------------------
+D6. [LOW] receive/after :badtimeout error path skips Of.reset_vars
+    expr.ex:583-588
+    https://github.com/elixir-lang/elixir/pull/15527
+--------------------------------------------------------------------------------
+The success path resets after-clause refinements (Of.reset_vars, :584); the
+badtimeout error path returns the un-reset context (refinements from the
+after body and the timeout-vs-`integer() or :infinity` narrowing persist).
+Consequences are limited to cascading effects after an already-correct
+warning; internal inconsistency.
+
+--------------------------------------------------------------------------------
+D7. [DOC] Stale @doc example on tuple_fetch
+    descr.ex:5505-5506
+    https://github.com/elixir-lang/elixir/pull/15528
+--------------------------------------------------------------------------------
+The example claims tuple_fetch(union(tuple([integer()]), tuple([integer(),
+atom()])), 1) returns {true, atom()}; the implementation returns :badindex
+(deliberate per the comment at 5524-5537). No doctest exists, so it never
+fails CI.
+
+--------------------------------------------------------------------------------
+D8. [LOW] compatible_intersection/2 accepts empty inputs that compatible?/2
+    rejects
+    descr.ex:928-972
+    https://github.com/elixir-lang/elixir/issues/15511
+--------------------------------------------------------------------------------
+`compatible_intersection/2` documents that it returns the intersection "only if
+they are compatible. Otherwise returns :error", and most clauses follow
+`compatible?/2`'s restricted-consistent-subtyping rule. The special
+`compatible_intersection(other, :term)` shortcut does not check compatibility:
+
+    compatible?(none(), term())               # => false
+    compatible_intersection(none(), term())   # => {:ok, none()}
+
+Same for the non-normalized empty gradual form produced by A3:
+
+    compatible?(%{dynamic: %{}}, term())              # => false
+    compatible_intersection(%{dynamic: %{}}, term())  # => {:ok, %{dynamic: %{}}}
+
+This is narrow because the left side is uninhabited/dead-code, so it is not a
+user-facing false positive by itself. It is still an internal contract bug: the
+refinement helper can report success for a pair that the predicate says is not
+compatible, which makes compatibility-based laws and callers disagree.
+
+================================================================================
+NOTES — OBSERVED ODDITIES JUDGED INTENTIONAL (not counted as bugs)
+================================================================================
+Re-examined by two independent reviews plus direct empirical checks. Each
+item below carries the reconciled verdict. NOTE: the confrontation upgraded
+two of these from "intentional/benign" to genuine (low-severity) bugs — see
+N4 (diagnostic false negative) and N5 (real precision bug). They are kept in
+this section for provenance but are NOT actually "intentional".
+
+N1. fun(1) vs fun([none()], term()) — DOC/PRINTER AMBIGUITY, not soundness.
+    Verified: both print "(none() -> term())" but equal? is false; only
+    fun([none()], term()) <: fun(1). fun(1) is the abstract arity-1 BDD top
+    (descr.ex:174), a strictly larger lattice element than the maximal arrow.
+    Both behave identically as tops for concrete arrows (supertype of any
+    arrow; absorb arrows under union), so the lattice is internally
+    consistent. The fun/1 docstring example `fun(1) #=> (none -> term)` is
+    actively misleading (implies equality). Action: clarify the docstring
+    and/or disambiguate the printer. Low priority.
+
+N2. map_descr_pair static collapse (descr.ex:2839, trigger at :2846) —
+    SOUND-BUT-IMPRECISE gradual-lower-bound precision bug; maintainer call.
+    `static_empty? = static_value == @none` collapses the WHOLE map to purely
+    dynamic. Correct for a required atom field (a none() required value really
+    does empty the static map), but wrong for always-optional domain/optional
+    values. Verified: closed_map([{[:integer], dynamic()}, {:b, integer()}])
+    becomes %{dynamic: ...} with static lower bound none(), discarding the
+    legitimate static part %{b: integer()} (the integer-domain key is
+    optional, so the map can exist with only :b). Direction is toward-dynamic
+    (more permissive) => safe (no false positives). Tightenable by gating
+    static_empty? to required fields.
+
+N3. %URI{} vs bare %{__struct__: URI} — DESIGN CHOICE (struct well-formedness).
+    Verified match?(%URI{}, %{__struct__: URI}) == true at runtime, but the
+    typer models %URI{} as the well-formed closed struct, so the intersection
+    with a bare struct map is empty => "never match". This is the deliberate
+    "__struct__ implies a well-formed struct" invariant; constructing bare/
+    ill-formed structs is discouraged. Not a bug unless the invariant is
+    reconsidered.
+
+N4. :erlang.is_integer/3 signature (apply.ex:344; commit 127901b8f) —
+    LOW-PRIORITY DIAGNOSTIC FALSE NEGATIVE on OTP without the BIF (upgraded
+    from "benign"). Deliberate forward-compat for the upcoming range guard
+    is_integer(Term, Min, Max). BUT the effect is not benign: in
+    signature/6 (apply.ex:1516-1519) a non-:none static signature
+    short-circuits and SKIPS export/6, the only path that emits the
+    {:undefined, ...} warning (apply.ex:1563). Verified empirically:
+    :erlang.is_integer(x, 1, 2) type-checks cleanly as boolean() with no
+    diagnostic, while the equally-non-existent :erlang.totally_made_up_fun(x)
+    warns {:badfunction, :erlang}. So on OTP where is_integer/3 is undef, a
+    call to it is silently accepted instead of warned undefined — a real (if
+    minor) false negative for as long as such OTP is supported.
+
+N5. tuple_delete_at over-approximation (tuple_delete_static, descr.ex:5258) —
+    REAL precision bug (over-approx = allowed direction), shares B3's root
+    cause. Verified: tuple_delete_at(t2, 0) on size>=2 tuples (t2 built as
+    open\{}\{term}) yields {...} admitting {}, while the equal? canonical
+    open_tuple([term(),term()]) deletes to {term(), ...}; congruence is
+    violated and layout is lost. Mechanism: tuple_delete_static uses the
+    SHARED projection machinery (tuple_bdd_to_dnf_with_negations +
+    tuple_take_element + tuple_split_negative +
+    tuple_pair_projection_keeps_full_snd?), i.e. the same optional-marker path
+    as tuple_fetch (B3) — NOT the bdd_map/:bdd_top path of tuple_insert.
+    IMPORTANT: it is fixed by the B3 work ONLY if that fix touches the shared
+    projection/optional-marker machinery; a local patch to tuple_fetch alone
+    (e.g. a recompute inside tuple_bdd_fetch_static) does NOT fix it. There
+    are three distinct sites: tuple_fetch + tuple_delete share the projection
+    machinery; tuple_insert is a separate bdd_map/:bdd_top bug.
+
+================================================================================
+AREAS EXERCISED AND FOUND CLEAN (high-level)
+================================================================================
+- descr core: atom/bitmap algebra, union/intersection/difference dispatch,
+  empty?/subtype?/equal?/disjoint?/compatible? mutual consistency,
+  booleaness/truthiness, optimized predicates vs definitional versions
+  (~190k randomized law checks; all violations trace to findings above).
+- fun types: BDD helpers (bdd_union/intersection/difference/negation)
+  verified against node semantics and ~5.5k law checks; phi/fun_line_empty?
+  emptiness vs an independent implementation of the exponential formula
+  (2k cases); fun_apply static direction vs the reference application
+  formula (3.5k cases) — no false :badarg, no too-narrow results.
+- maps: map_fetch_key (20k-case oracle), map_put_key (8k), map_get with
+  domains/negated keys, map_union optimizations, map_literal_intersection,
+  emptiness machinery and map_difference_strategy — B1 is fixed on this
+  checkout; remaining violations trace to B2 when patched out experimentally.
+- lists: intersection/difference/emptiness proven exact for the element/last
+  model; list_hd sound.
+- tuples: sizes strategy, literal intersection, leaf difference,
+  emptiness (300-case identity battery), tuple_values, union optimizers.
+- apply.ex: hardcoded signature table verified entry-by-entry against OTP 28
+  runtime behavior (module_info, __info__, behaviour_info, __protocol__,
+  :erlang.error opts, send destinations, :maps.*); multi-clause domain
+  partitioning; guard-driven narrowing incl. mirrored/inverted size guards;
+  dynamic propagation — ~20 adversarial compile probes, all clean except B7.
+- pattern.ex: or/orelse refinement, ==/!= numberize, hd/tl subpattern
+  caching, `in` reconstruction, size-guard comparisons, domain/pinned map
+  keys, %var{}/%^var{}, repeated vars, match chains, improper lists,
+  previous-clause subtraction, utf/float/bits segments, generators — ~15
+  runtime-valid modules compile silently.
+- expr.ex: map/struct update, full try/rescue/catch/else/after, receive,
+  with (incl. truthful never-match warnings), comprehensions into:/reduce/
+  uniq, reverse-arrow caching under deep nesting, closures — clean except
+  B6/D6. traverse.ex reviewed line-by-line against expander normalizations.
+- types.ex: recursion/in-progress handling loses precision only (never
+  stale-over-precise); union_args widening sound; context restore paths.
+- The shipped descr_test.exs suite passes throughout (132 tests).
+================================================================================
+
+================================================================================
+E. NEW FINDINGS — 2026-07-02 fuzzing session (HEAD 6f9f2d142, elixir 1.21.0-dev)
+================================================================================
+Found by the rebuilt harnesses lib/elixir/scripts/descr_fuzz.exs (value-model
+membership oracle over concrete values incl. list values, projection soundness
+oracles, congruence oracles with representation-flipping rebuilds) and
+lib/elixir/scripts/apply_fuzz.exs (feature-grammar programs with per-clause
+runtime witnesses; execution-FP / clause-reachability / checker-crash /
+metamorphic oracles). Both deterministic per seed; repro commands below re-fire
+the exact finding. Raw operand dumps: DESCR_FUZZ_RAW=1.
+
+Status re-confirmed OPEN on this checkout: A1 (defimpl for Erlang module
+crash — found organically by apply_fuzz's crash oracle, which v1 could not
+see), C1 (list_tl), B2 (map_put excludes achievable results), B3
+(tuple_fetch :badindex), C5 (tuple_insert_at :bdd_top). All five are found
+organically by the new harnesses in a single ~20s sweep
+(descr_fuzz --seeds 1-30 --samples 3000 --depth 4; apply_fuzz --seeds 1-10
+--samples 400).
+
+Checked and CLEAN (to prevent re-reporting): fun_apply congruence holds once
+{:badarg, domains, thrown?} payloads are compared with pairwise equal? — the
+returned domain descrs differ in representation (and print differently) but
+denote equal sets; only a cosmetic printer divergence.
+
+--------------------------------------------------------------------------------
+E1. [MEDIUM] tuple_insert_at crashes with KeyError on a gradual descr whose
+    static part is a non-normalized-empty LIST component
+    descr.ex:5341-5367 (tuple_insert_at_checked, gradual branch) +
+    descr.ex:5369-5371 (tuple_insert_static: syntactic `descr == @none` guard,
+    then Map.update!(descr, :tuple, ...)); enabled by list constructors
+    storing none() element/last types (descr.ex:2150 "none() types can be
+    given and, while stored, it means the list type is empty")
+--------------------------------------------------------------------------------
+non_empty_list(integer(), none()) is stored as %{list: leaf(integer, none)} —
+semantically empty but syntactically non-empty (A3 family: non-normalized
+empties circulate). Union it with dynamic() and call tuple_insert_at:
+`tuple_only?(static)` answers SEMANTICALLY (the list component is empty, so
+"tuple only" is vacuously true), but tuple_insert_static's guard
+`descr == @none` is SYNTACTIC, so the static part reaches
+Map.update!(%{list: ...}, :tuple, ...) and raises.
+
+Repro:
+    import Module.Types.Descr
+    a = opt_union(dynamic(), non_empty_list(integer(), none()))
+    tuple_insert_at(a, 1, atom([:x]))
+    # ** (KeyError) key :tuple not found in: %{list: {130511147, %{bitmap: 8}, %{}}}
+Second auto-shrunk variant (recipe shrinker, 2026-07-03; verified) — here the
+dynamic part is carried by the tuple and the non-normalized empty list
+literal comes from non_empty_list(none()):
+    a = opt_union(tuple([dynamic()]), non_empty_list(none()))
+    tuple_insert_at(a, 1, atom([:x]))   # ** (KeyError) key :tuple not found
+    # (tuple_fetch/tuple_delete_at on the same descr return :badindex cleanly)
+Control: opt_union(dynamic(), non_empty_list(integer())) => :badtuple (no
+crash); the non-normalized empty static part is required.
+Expected: :badtuple or a clean result — never a raise.
+Fuzzer: "projections never crash on non-empty input"
+    bin/elixir lib/elixir/scripts/descr_fuzz.exs --seeds 1 --samples 200 --depth 4
+    (post-recipe-rewrite stream, 2026-07-03; fires at seed 1, sample 85)
+Fix direction: normalize empty list/tuple/map components at construction (the
+general A3-family fix), or make tuple_insert_static's guard semantic.
+
+--------------------------------------------------------------------------------
+E2. [MEDIUM] map_fetch_key verdict depends on type REPRESENTATION: equal?
+    types answer {false, type} vs :badkey — the :badkey side is a
+    false-positive-producing verdict for a key that is always present
+    (map analog of B3's representation-dependence)
+--------------------------------------------------------------------------------
+For extensionally equal descrs t and t' (equal?(t, t') == true),
+map_fetch_key(t, :a) returns {false, <tuple type>} (key present in every
+member) while map_fetch_key(t', :a) returns :badkey (would produce a "key may
+not be present" diagnostic on correct code). t' is built from t by the
+representation-flipping identity t' = cover \ (cover \ t) with
+cover = t ∪ knife.
+
+Verified standalone against this build. Repro (paste as-is):
+    import Module.Types.Descr
+    {t, _} = Code.eval_string("""
+    %{map: {-2458782, :closed, [a: %{tuple: {-84443419, :closed, [%{map: {-87788854, :closed, [b: %{map: {122685272, :open, [a: %{tuple: {-113427502, :closed, []}}, b: %{fun: {:union, %{1 => :bdd_top}}}, c: %{tuple: {-113427502, :closed, []}, optional: 1}]}, optional: 1}]}}]}}]}}
+    """)
+    {knife, _} = Code.eval_string("""
+    %{map: {89896648, :open, [c: %{tuple: {-61656568, :closed, [%{list: {118775622, %{}, %{bitmap: 4}}}, %{fun: {:union, %{2 => {126609474, [%{list: {17513377, %{bitmap: 3}, %{bitmap: 4}}}, %{}], %{fun: {:union, %{1 => {2882254917, {64029515, [%{atom: {:negation, %{}}}], %{bitmap: 64}}, {101305799, [%{bitmap: 8}], %{map: {61102469, :open, []}}}, :bdd_bot, :bdd_bot}}}}}}}}, %{list: {26460323, %{atom: {:union, %{false: [], true: []}}}, %{bitmap: 4}}, tuple: {-113427502, :closed, []}}]}}]}}
+    """)
+    cover = opt_union(t, knife)
+    t2 = opt_difference(cover, opt_difference(cover, t))
+    equal?(t, t2)             # => true
+    map_fetch_key(t, :a)      # => {false, <type>}   (key :a always present)
+    map_fetch_key(t2, :a)     # => :badkey           (WRONG: same type!)
+Note the knife contains a non-normalized empty component
+(%{list: {_, %{}, %{bitmap: 4}}} — a list literal with none() elements), the
+recurring enabler in this family. The inline terms above are the canonical
+repro (verified standalone). Fuzzer re-fire on the current script version:
+    DESCR_FUZZ_RAW=1 bin/elixir lib/elixir/scripts/descr_fuzz.exs \
+      --seeds 54 --samples 3600 --depth 4
+    # law "congruence: map_fetch_key agrees on a and a'" (seed 54, sample 3539)
+
+--------------------------------------------------------------------------------
+E3. [MEDIUM] map_put result depends on type REPRESENTATION: equal? inputs
+    produce non-equal? result types (B2 family: at least one of the two
+    results misstates the set of achievable runtime maps)
+--------------------------------------------------------------------------------
+With t = empty_map() and a complex knife (open map with fun-typed fields),
+the partition rebuild t' = (t ∩ knife) ∪ (t \ knife) satisfies equal?(t, t')
+yet map_put(t, atom(), knife) and map_put(t', atom(), knife) return {:ok, r1}
+and {:ok, r2} with equal?(r1, r2) == false. Since map_put(t, key, val) has one
+correct answer for a given SET t, at least one result is wrong — either
+excluding achievable Map.put outcomes (false-positive direction, as in B2) or
+including impossible ones.
+
+Verified standalone against this build (raw operands captured via
+DESCR_FUZZ_RAW=1; knife ~2.7KB, not inlined here). Deterministic re-fire:
+    bin/elixir lib/elixir/scripts/descr_fuzz.exs --seeds 2 --samples 120 --depth 4
+    # law "congruence: map_put agrees on a and a'" (seed 2, sample 118)
+    DESCR_FUZZ_RAW=1 ... to dump the exact operand terms.
+
+--------------------------------------------------------------------------------
+E4. [ADDENDUM to B3/N5] tuple_fetch congruence violation: equal? types answer
+    :badindex vs {false, type}
+--------------------------------------------------------------------------------
+Same shared-projection-machinery root cause as B3 (see N5 for the three-site
+analysis: tuple_fetch + tuple_delete share the optional-marker projection
+path; tuple_insert is the separate bdd_map/:bdd_top bug). Recorded here
+because the new congruence oracle exhibits it directly as representation
+dependence: for a fuzzer-produced t (tuples with negations),
+t' = term() \ (term() \ t) is equal? to t, yet tuple_fetch(t, 1) == :badindex
+while tuple_fetch(t', 1) == {false, <type>}. Any fix for B3 should be
+validated with the congruence law, not only the original repro:
+    bin/elixir lib/elixir/scripts/descr_fuzz.exs --seeds 1 --samples 2800 --depth 4
+    # law "congruence: tuple_fetch agrees on a and a'" (seed 1, sample 2706)
+
+================================================================================
+F. NEW FINDINGS — 2026-07-03 tooling session (HEAD 6f9f2d142, elixir 1.21.0-dev)
+================================================================================
+Three new validation tools were added alongside the fuzzers:
+lib/elixir/scripts/descr_model.exs (finite-universe reference model: exact
+denotations over an enumerated 1587-value universe — catches wrong-but-self-
+consistent implementations that law-based fuzzing structurally cannot see),
+lib/elixir/scripts/sig_conformance.exs (executable validation of the ~143
+hardcoded remote signatures in Module.Types.Apply), and
+lib/elixir/scripts/infer_soundness.exs (witness-based soundness of INFERRED
+signatures read from the "ExCk" beam chunk). descr_fuzz.exs was rewritten on
+top of lib/elixir/scripts/descr_recipe.exs and now SHRINKS failing operands
+to minimal constructor source.
+
+No new soundness bugs were found by the new tools on this tree — descr_model
+independently re-finds B3 and C1 (with smaller auto-shrunk repros, folded
+into those entries above), infer_soundness passes 3930 witness checks, and
+sig_conformance passes after one triage:
+
+--------------------------------------------------------------------------------
+F1. [LOW, likely intentional] :erlang.raise/3 signature domain excludes a
+    documented non-raising call shape
+    apply.ex signature table: {:erlang, :raise, [{[:error|:exit|:throw class,
+    term, stacktrace], none()}]}-style entry
+    (found by sig_conformance.exs, seed 1)
+--------------------------------------------------------------------------------
+Per OTP documentation, :erlang.raise(Class, Reason, Stacktrace) with an
+INVALID class does not raise — it RETURNS the atom :badarg:
+    :erlang.raise(true, 0, [])   # => :badarg  (no exception)
+The claimed domain for the class argument (:error or :exit or :throw) is
+therefore technically too narrow: code passing a non-literal class that
+handles the :badarg return works at runtime but gets an "expected one of"
+warning. Almost certainly a deliberate lint (a non-literal class is nearly
+always a bug), so triaged LIKELY INTENTIONAL and skiplisted in
+sig_conformance.exs with a dated comment. Recorded so the divergence between
+the signature and documented OTP behavior is on file.
+
+================================================================================
+HARNESS NOTES (for maintainers running these as gates)
+================================================================================
+NOTE: descr_fuzz.exs was rewritten on 2026-07-03 to generate operands as
+recipes (descr_recipe.exs) and shrink failures. Its random streams CHANGED:
+seed/sample references inside section E predate the rewrite and no longer
+re-fire at those exact positions. The INLINE repros in each entry remain the
+authoritative reproductions; current-stream re-fire positions for the still-
+open bugs on this tree: canonical sweep (--seeds 1-30 --samples 3000
+--depth 4, ~40s) fails 6 laws (C1, B2, B3, C5-congruence, E1-crash, E3);
+E2/E4 fire on other seeds.
+
+- descr_model.exs: the strongest oracle — PASS requires the implementation to
+  match exact set denotations over the finite universe. Current tree fails
+  exactly 2 checks (B3 via den-exact :badindex coverage, C1 via list_tl
+  member preservation), with auto-shrunk recipes; zero false failures in
+  5000-sample sweeps. Canary-validated including the wrong-but-consistent
+  class (integer() silently denoting floats is invisible to descr_fuzz but
+  caught here within a few hundred samples). Scope: static fragment, flat
+  constructor elements, funs only as tops, no domain keys — nested
+  interactions remain descr_fuzz territory.
+- descr_fuzz.exs: PASS requires zero law violations. Current tree: 6 laws on
+  the canonical sweep (see NOTE above). Failing operands are shrunk and
+  printed as copy-pasteable constructor source; the shrinker converges to the
+  canonical repros in this file. The value model reads only the :list BDD
+  internals; on representation refactors it degrades to counted "model
+  skips" — a skip explosion means the model needs updating, not that types
+  are correct.
+- apply_fuzz.exs: PASS requires zero findings. Current tree yields exactly one
+  distinct finding: the A1 defimpl crash (checker_crash oracle). Generator
+  bugs must stay 0 (they are counted separately and are harness defects, not
+  checker findings). Oracle detection power is re-validatable via the canary
+  recipe in the script header (load a deliberately-broken Module.Types module
+  into the VM, run in-process, expect the corresponding oracle to fire).
+- sig_conformance.exs: PASS on this tree (after the F1 triage). Hard-fails on
+  returns outside claimed types and out-of-domain calls that succeed; both
+  detectors canary-validated (corrupt byte_size return/domain to pid()).
+  In-domain raises are INFO (--info) — the false-negative direction.
+- infer_soundness.exs: PASS on this tree (3930 witness checks). BOTH oracles
+  canary-validated end-to-end: the return oracle via a corrupted byte_size
+  return propagating into inferred signatures; the domain oracle via the
+  GUARD signature table (is_guards in apply.ex) — changing is_integer's
+  refinement type to pid() poisons inferred domains derived from guards, and
+  working integer witnesses are flagged outside them (24 findings in a
+  160-sample canary run, including through map patterns). Body-call
+  signatures cannot reach inferred domains; the guard table is the right
+  poisoning lever.
+================================================================================

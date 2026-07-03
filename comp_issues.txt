@@ -1,0 +1,629 @@
+1. Correctness issue - not a bug
+File: `lib/elixir/src/elixir_expand.erl:109-119, 956-961, 987-990`
+`require` with `{defined, Mod}` records function-local modules in `S#elixir_ex.runtime_modules`, and `attach_runtime_module/4` adds `{runtime_module, true}` metadata for later remote calls. But the new undefined-function warning in `expand_remote/8` ignores that runtime-module path and unconditionally calls `is_loaded_and_exported/3`. For a module defined inside the current function, the module is not loaded yet during expansion, so valid calls get a spurious warning.
+Repro:
+`elixir -e 'Code.compile_string("defmodule A do\n  def foo do\n    defmodule B do\n      def bar(_x), do: :ok\n    end\n\n    B.bar(x)\n  end\nend\n")'`
+Observed output includes the real error for undefined variable `x`, plus the false warning `function A.B.bar/1 is undefined (module A.B is not available)` for the valid local runtime-defined module call.
+
+2. Compilation issue - low priority
+File: `lib/elixir/src/elixir_expand.erl:63-70`
+The multi-alias branch calls `lists:keymember(as, 1, Opts)` without first checking that `Opts` is a list. If invalid quoted AST reaches `alias/require/import Foo.{...}, Opts`, expansion crashes with raw Erlang `badarg` instead of reporting a normal compiler error through `expand_opts/5` or `file_error/4` like neighboring branches do.
+Repro:
+`elixir -e 'ast = {:alias, [], [{{:., [], [{:__aliases__, [], [:Foo]}, :{}]}, [], [{:__aliases__, [], [:Bar]}]}, 1]}; try do Code.eval_quoted(ast) catch kind, reason -> IO.inspect({kind, reason}) end'`
+Observed output: `{:error, :badarg}`.
+
+3. Metadata issue - fixed
+File: `lib/elixir/src/elixir_bitstring.erl:54-64`
+In the non-`::` bitstring-segment branch, the recursive call passes `Meta` instead of `BitstrMeta`:
+`expand(Meta, Fun, T, EAcc, {SS, OriginalS}, ES, Alignment, RequireSize)`.
+That changes the fallback metadata for all following segments from the enclosing bitstring metadata to the current segment metadata. As a result, any later segment without its own metadata inherits the previous segment's line/column information, so inferred specs and diagnostics can point at the wrong source location.
+Reasoning path:
+For `<<x, "a">>`, the first segment `x` has its own metadata, so `Meta = extract_meta(H, BitstrMeta)` becomes `x`'s metadata. Line 64 then stores that as the next `BitstrMeta`. The following literal segment `"a"` has no segment metadata, so `extract_meta/2` falls back to `x`'s metadata instead of the enclosing bitstring metadata. Upstream keeps `BitstrMeta` in the recursive call, which preserves correct fallback metadata.
+
+4. Correctness issue - low priority
+File: `lib/elixir/src/elixir_import.erl:60-63, 109-117, 171-183`
+`import_only_except/7` explicitly accepts `only: :sigils`, but the sigil-import path calls `InfoCallback(functions)` / `InfoCallback(macros)` directly instead of using the safe `get_functions/2` / `get_macros/1` helpers. For Erlang modules, `InfoCallback` is `fun Ref:'__info__'/1`, so `import :lists, only: :sigils` crashes with `UndefinedFunctionError` instead of behaving like an empty/no-op import.
+Repro:
+`elixir -e 'Code.compile_string("defmodule T do\n  import :lists, only: :sigils\nend\n")'`
+Observed output raises `** (UndefinedFunctionError) function :lists.__info__/1 is undefined or private` from `elixir_import.import_sigil_functions/6`.
+
+5. Metadata issue - fixed
+File: `lib/elixir/src/elixir_import.erl:249-252`
+The `invalid :only option` diagnostic says the atom form may only be `:functions` or `:macros`, but this module also accepts `:sigils` at lines 60-63. The error text is therefore incorrect and omits a valid option.
+Repro:
+`elixir -e 'x = :bad; try do Code.eval_string("import Kernel, only: x", [x: x]) rescue e -> IO.puts(Exception.message(e)) end'`
+Observed output says `expected value to be an atom :functions, :macros, ...`, even though `import Kernel, only: :sigils` is valid.
+
+6. Compilation issue - low priority
+File: `lib/elixir/src/elixir_quote.erl:286-299, 309`
+`quote` accepts any integer for the `:line` option because `is_valid(line, Line) -> is_integer(Line)`. That includes negative integers, but later compilation turns metadata into Erlang annotations and `:erl_anno.new/1` rejects negative line numbers. So invalid quote metadata is accepted here and then crashes later in the compiler pipeline instead of being rejected up front.
+Repro:
+`elixir -e 'try do Code.eval_quoted(quote line: -1 do 1 + 2 end) rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output raises `** (ArgumentError) argument error` from `:erl_anno.new(-1)` via `src/elixir_erl.erl:55`.
+
+7. Metadata issue - fixed
+File: `lib/elixir/src/elixir_dispatch.erl:320-324, 365-367`
+Ambiguous import detection drops whether the conflicting candidates were functions or macros, but `format_error/1` always reports `function ... imported from both ...`. That makes macro/function and macro/macro ambiguities report the wrong kind in the diagnostic.
+Repro:
+`elixir -e 'Code.compile_string("defmodule A do\n  defmacro foo(x), do: x\nend\n\ndefmodule B do\n  def foo(x), do: x\nend\n\ndefmodule C do\n  import A\n  import B\n  foo(1)\nend\n")'`
+Observed output: `error: function foo/1 imported from both B and A, call is ambiguous`, even though `A.foo/1` is a macro, not a function.
+
+8. Compilation issue - low priority
+File: `lib/elixir/src/elixir_module.erl:281-301, 303-315, 661-668`
+Malformed `@compile {:inline, ...}` entries can crash the compiler instead of producing a structured error. `validate_inlines/4` forwards arbitrary terms as `{undefined_function, {compile, inline}, Inline}`, but `format_error/1` only handles the `{Name, Arity}` shape. Non-function-ref entries like `:foo` or `123` therefore crash in the formatter with `FunctionClauseError`, and malformed tuples like `foo: :bar` can also blow up inside `io_lib:format/2` because `~B` receives a non-integer arity.
+Repro:
+`elixir -e 'try do Code.compile_string("defmodule T do\n  @compile {:inline, [:foo]}\nend\n") rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output raises `** (FunctionClauseError) no function clause matching in :elixir_module.format_error/1`.
+
+9. Metadata issue - low priority
+File: `lib/elixir/src/elixir_module.erl:317-327, 329-348, 540-549`
+Validation errors for module attributes such as `@on_load`, `@dialyzer`, and `@nifs` are reported at the `defmodule` line instead of the attribute line. The attribute machinery records per-attribute location metadata earlier, but `attributes/3` reduces attributes to `{Key, Value}` and discards that location. The later validators then call `module_error([{line, Line}], ...)` with the module-definition line from `compile/7`, so diagnostics lose their real source location.
+Repro:
+`elixir -e 'try do Code.compile_string("defmodule T do\n\n\n  @on_load {:foo, 0}\nend\n") rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output reports `undefined function foo/0 given to @on_load` at `nofile:1`, even though the invalid attribute is on line 4.
+
+10. Correctness issue - not a bug
+File: `lib/elixir/src/elixir_erl_pass.erl:230-277`
+Guard field access is handled inconsistently for literal receivers. The guard-specific `.field` translation uses safe `erlang:map_get/2` only when the receiver is a tuple, but `nil.foo`, `true.foo`, and `false.foo` fall through to the generic field/call translation path. In guard context that is rejected as a remote call, producing `cannot invoke remote function nil.foo/0 inside a guard`, even though field access in guards should simply behave like guard-safe map access and fail the guard for non-maps.
+Repro:
+`elixir -e 'try do Code.compile_string("defmodule M do\n  def f(x) when nil.foo, do: :ok\n  def f(_), do: :error\nend\n") rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output raises `error: cannot invoke remote function nil.foo/0 inside a guard`.
+Reasoning check: the dynamic form `x.foo` in guards compiles and simply fails for `nil`/`false`/`true`, so the literal forms are being mishandled.
+
+11. Correctness issue - documented
+File: `lib/elixir/src/elixir_erl_for.erl:169-185, 199-204`
+`for ... into:` uses the initial accumulator from `Collectable.into/1` in the exception cleanup path instead of the current accumulator. `stacktrace_clause/6` calls `Fun(Acc, :halt)`, but `Acc` there is the original accumulator bound before reduction, not the partially accumulated state after earlier successful `{:cont, value}` steps. This loses already collected values on exceptions.
+Repro:
+`elixir -e 'Code.compile_string("defmodule C do\n  defstruct [:pid]\nend\n\ndefimpl Collectable, for: C do\n  def into(%C{pid: pid}) do\n    {[], fn\n      acc, {:cont, x} -> [x | acc]\n      acc, :done -> send(pid, {:done, Enum.reverse(acc)}); :ok\n      acc, :halt -> send(pid, {:halt, Enum.reverse(acc)}); :ok\n    end}\n  end\nend\n"); parent = self(); try do for x <- [1, 2], into: struct(C, pid: parent) do if x == 2, do: raise("boom"); x end rescue _ -> :ok end; receive do msg -> IO.inspect(msg) end'`
+Observed output is `{:halt, []}`. The first element was already consumed successfully, so the cleanup callback should receive the current accumulator and report `{:halt, [1]}` instead.
+
+12. Compilation issue - low priority
+File: `lib/elixir/src/elixir_erl.erl:52-56`
+`elixir_erl:get_ann/1` accepts any integer `line` and `column` metadata, then blindly passes them to `erl_anno:new/1`. Erlang annotations reject invalid locations such as `column: 0`, `column: -1`, and negative line numbers, so malformed quoted metadata can crash the backend with raw `badarg` instead of producing a structured Elixir diagnostic.
+Repro:
+`elixir -e 'for ast <- [{:+, [line: 1, column: -1], [1, 2]}, {:+, [line: 1, column: 0], [1, 2]}] do try do Code.eval_quoted(ast) rescue e -> IO.puts("---"); IO.puts(Exception.format(:error, e, __STACKTRACE__)) end end'`
+Observed output raises `** (ArgumentError) argument error` from `:erl_anno.new({1, -1})` and `:erl_anno.new({1, 0})` via `src/elixir_erl.erl:56`.
+
+13. Metadata issue - low priority
+File: `lib/elixir/src/elixir_erl.erl:378-379, 431-449, 681-683`
+Optional-callback validation errors are reported at the module location instead of the offending `@optional_callbacks` attribute. `validate_behaviour_info_and_attributes/2` and `validate_optional_callbacks/3` call `file_error(Map, ...)`, and `file_error/2` extracts only the module-level `anno/file` from `Map`, not the attribute site's metadata. As a result, these diagnostics lose their real source location.
+Repro:
+`elixir -e 'try do Code.compile_string("defmodule M do\n  @optional_callbacks foo: 1\nend\n", "sample.ex") rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output reports `unknown callback foo/1 given as optional callback` at `sample.ex:1`, even though the offending attribute is on line 2.
+
+14. Correctness issue - fixed
+File: `lib/elixir/src/elixir_compiler.erl:100-103, 127-128`
+Temporary compiler modules are not returned to the code-server pool when the compiled expression raises at runtime. `dispatch/4` calls `Module:Fun(Args)` and only then calls `return_compiler_module/2`, so an exception skips the cleanup cast entirely. Repeated failing evaluations therefore keep allocating new temporary modules instead of recycling them.
+Repro:
+`elixir -e 'env = :elixir.env_for_eval(file: "nofile", line: 1); IO.inspect(:sys.get_state(:elixir_code_server)); for _ <- 1..5 do try do :elixir_compiler.compile(quote(do: raise "boom"), [], [], env) rescue _ -> :ok end end; IO.inspect(:sys.get_state(:elixir_code_server))'`
+Observed code-server state changes from `{:elixir_code_server, %{}, {[], [], 0}, %{}}` to `{:elixir_code_server, %{}, {[], [], 5}, %{}}`, showing five compiler modules were allocated and none returned to the reusable pool.
+
+15. Metadata issue - not a bug
+File: `lib/elixir/src/elixir.erl:403-413`
+`eval_external_handler/3` always appends `Macro.Env.stacktrace(...)` for the current eval site before re-raising. If the exception already passed through another eval-managed external call, the inner handler has already inserted that eval-site frame, so the outer handler inserts the same file/line again. This produces duplicated synthetic stacktrace frames for a single eval location.
+Repro:
+`elixir -e 'try do Code.eval_string("Enum.map([1], fn x -> hd(x) end)", [], file: "myfile") rescue _ -> IO.inspect(Enum.take(__STACKTRACE__, 6)) end'`
+Observed stacktrace starts with two identical eval-site frames:
+`{:elixir_compiler, :__FILE__, 1, [file: ~c"myfile", line: 1]}`
+appearing twice in a row.
+
+16. Metadata issue - invalid spec and docs - fixed
+File: `lib/elixir/src/elixir.erl:442-448`
+`string_to_tokens/5` receives the current `File` but ignores it and calls `elixir_tokenizer:tokenize(String, StartLine, StartColumn, Opts)` without adding file metadata. This breaks the documented `static_atoms_encoder` contract in `lib/elixir/lib/code.ex:1321-1323`, which says the encoder receives the current file, line, and column.
+Repro:
+`elixir -e 'encoder = fn atom, meta -> IO.inspect({atom, meta}); {:ok, :ok} end; Code.string_to_quoted!(":foo", file: "sample.ex", static_atoms_encoder: encoder)'`
+Observed encoder metadata is `{"foo", [line: 1, column: 1]}` with no `file: "sample.ex"` entry.
+
+17. Compilation issue - fixed
+File: `lib/elixir/src/elixir.erl:442-443`
+`string_to_tokens/5` validates `StartLine` and `File` at the function head but does not validate `StartColumn` before passing it into the tokenizer. Invalid `:column` values therefore crash inside tokenizer arithmetic instead of producing a normal parse/argument error.
+Repro:
+`elixir -e 'try do Code.string_to_quoted!("1", column: :foo) rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output raises `** (ArithmeticError) bad argument in arithmetic expression` from `:erlang.+(:foo, 1)` via `src/elixir_tokenizer.erl:604` and `src/elixir.erl:443`.
+
+18. Correctness issue - PR submitted
+File: `lib/elixir/lib/kernel.ex:6405-6412, 6426-6431, 6435-6478`
+`Kernel.to_timeout/1` accepts `Duration.t()` but does not reject negative effective durations. The `%Duration{}` clause rejects non-zero `year` and `month`, then sums signed `week/day/hour/minute/second/microsecond` fields directly and can return a negative integer such as `-1000`. That violates its own `@spec ... :: timeout()` contract and is inconsistent with the keyword-list clause, which explicitly rejects negative components.
+Repro:
+`elixir -e 'IO.inspect(Kernel.to_timeout(Duration.new!(second: -1))); try do Kernel.to_timeout(second: -1) rescue e -> IO.puts(Exception.message(e)) end; try do Process.send_after(self(), :msg, Kernel.to_timeout(Duration.new!(second: -1))) rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output:
+`Kernel.to_timeout(Duration.new!(second: -1))` returns `-1000`,
+`Kernel.to_timeout(second: -1)` raises `timeout component :second must be a non-negative integer, got: -1`,
+and using the negative result in `Process.send_after/3` raises `** (ArgumentError) ... 1st argument: out of range`.
+
+19. Metadata issue - not a bug
+File: `lib/elixir/lib/kernel/typespec.ex:258-264, 424-432`
+`Kernel.Typespec` unconditionally warns that `type record/0 is overriding a built-in type`, even though its own `built_in_type?/2` check is version-sensitive and `:erl_internal.is_type(:record, 0)` is `false` on this OTP 28 runtime. The warning is therefore a false positive on runtimes where `record/0` is not actually built in.
+Repro:
+`elixir -e 'Code.compile_string("defmodule T do\n  @type record() :: atom()\nend\n")'`
+Observed output on this runtime:
+`warning: type record/0 is overriding a built-in type`
+while `elixir -e 'IO.inspect(:erl_internal.is_type(:record, 0))'` prints `false`.
+
+20. Metadata issue - low priority
+File: `lib/elixir/lib/protocol.ex:851-856, 917-924`
+The warning for `@optional_callbacks` inside a protocol loses the attribute line and is reported at the protocol module line instead. `@callback` and `@macrocallback` warnings preserve source metadata via `callback_metas/2`, but the `@optional_callbacks` branch reads the attribute value and then calls `warn(..., env, nil)`, which falls back to the protocol module environment location.
+Repro:
+`elixir -e 'try do Code.compile_string("defprotocol P do\n  def ok(x)\n  @optional_callbacks [ok: 1]\nend\n", "sample.ex") rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output reports:
+`warning: cannot define @optional_callbacks inside protocol, all of the protocol definitions are required`
+at `sample.ex:1: P (module)`, even though the offending `@optional_callbacks` attribute is on line 3.
+
+21. Correctness issue - not a bug?
+File: `lib/elixir/lib/io.ex:184-186`
+The deprecated `IO.read(device, :all)` path checks `:io.getopts(device)` instead of `:io.getopts(map_dev(device))`. That makes Elixir's `:stdio` alias behave differently from `:standard_io`, even though they refer to the same underlying device.
+Repro:
+`elixir -e ':io.setopts(:standard_io, binary: false); IO.inspect(IO.read(:stdio, :all)); IO.inspect(IO.read(:standard_io, :all))'`
+Observed output is `""` for `:stdio` but `[]` for `:standard_io`.
+
+22. Correctness issue - not a bug?
+File: `lib/elixir/lib/system.ex:1128-1145, 1206-1207, 1434-1443`
+`System.cmd/3` rejects NUL bytes in the executable path, but not in argument binaries or the `:arg0` option. Those values are passed through to the underlying OS spawn APIs and get truncated at the first NUL, so the public API silently changes the command data instead of rejecting invalid input.
+Repro:
+`elixir -e 'IO.inspect(System.cmd("echo", ["a\0b"])); IO.inspect(System.cmd("/bin/sh", ["-c", "printf %s \"$0\""], arg0: "x\0y"))'`
+Observed output is `{"a\n", 0}` and `{"x", 0}`: the `"\0b"` / `"\0y"` suffixes are silently dropped.
+
+23. Metadata issue - INVALID/NOT A BUG
+File: `lib/elixir/lib/system.ex:398-411`
+The `System.tmp_dir/0` documentation says fallback step 4 is `C:\TMP` on Windows or `/tmp` on Unix-like systems, but the implementation only ever tries `/tmp` and has no Windows-specific branch. The docs therefore describe behavior the code cannot perform.
+Reasoning path:
+The docs list step 4 as `C:\TMP` on Windows, but the implementation is:
+`write_env_tmp_dir(~c"TMPDIR") || write_env_tmp_dir(~c"TEMP") || write_env_tmp_dir(~c"TMP") || write_tmp_dir(~c"/tmp") || write_cwd_tmp_dir()`.
+There is no `:os.type()` branch and no `C:\TMP` probe anywhere in this fallback path.
+
+24. Correctness issue - documented
+File: `lib/elixir/lib/enum.ex:1561-1572, 1632-1643`
+`Enum.into/2` and `Enum.into/3` call the collectable `:halt` callback with the initial accumulator instead of the current accumulator when enumeration raises. This loses already collected values and breaks cleanup/finalization for custom `Collectable`s.
+Repro:
+`elixir -e 'Code.compile_string("defmodule C do\n  defstruct [:pid]\nend\n\ndefimpl Collectable, for: C do\n  def into(%C{pid: pid}) do\n    {[], fn\n      acc, {:cont, x} -> [x | acc]\n      acc, :done -> send(pid, {:done, Enum.reverse(acc)}); :ok\n      acc, :halt -> send(pid, {:halt, Enum.reverse(acc)}); :ok\n    end}\n  end\nend\n"); parent = self(); try do Enum.into([1, 2], struct(C, pid: parent), fn x -> if x == 2, do: raise("boom"); x end) rescue _ -> :ok end; receive do msg -> IO.inspect(msg) end'`
+Observed output is `{:halt, []}` even though `1` had already been collected successfully before the exception.
+
+25. Correctness issue - documented
+File: `lib/elixir/lib/stream.ex:588-613`
+`Stream.into/2,3` has the same stale-accumulator cleanup bug: it threads the live collectable state in `[acc | collectable]` during reduction, but on exception it still calls `into.(collectable, :halt)` with the original collectable accumulator captured before enumeration started.
+Repro:
+`elixir -e 'Code.compile_string("defmodule C do\n  defstruct [:pid]\nend\n\ndefimpl Collectable, for: C do\n  def into(%C{pid: pid}) do\n    {[], fn\n      acc, {:cont, x} -> [x | acc]\n      acc, :done -> send(pid, {:done, Enum.reverse(acc)}); :ok\n      acc, :halt -> send(pid, {:halt, Enum.reverse(acc)}); :ok\n    end}\n  end\nend\n"); parent = self(); stream = Stream.into([1, 2], struct(C, pid: parent), fn x -> if x == 2, do: raise("boom"); x end); try do Enum.to_list(stream) rescue _ -> :ok end; receive do msg -> IO.inspect(msg) end'`
+Observed output is again `{:halt, []}` instead of preserving the partially collected `[1]`.
+
+26. Correctness issue - low priority
+File: `lib/mix/lib/mix/tasks/format.ex:417-440`
+`Mix.Tasks.Format.formatter_for_file/2` documents `:root` as the current working directory to use, but `eval_dot_formatter/2` ignores that root when `:dot_formatter` is passed explicitly. It evaluates `opts[:dot_formatter]` verbatim instead of resolving it relative to `root/cwd`, so it may load the wrong formatter config or none at all.
+Repro:
+Create `/tmp/mix_format_root/.formatter.exs` containing `[line_length: 101]`, then run:
+`elixir -e 'Code.require_file("lib/mix/lib/mix/tasks/format.ex"); {_, opts} = Mix.Tasks.Format.formatter_for_file("lib/a.ex", root: "/tmp/mix_format_root", dot_formatter: ".formatter.exs"); IO.inspect(opts[:line_length])'`
+Observed output is `nil` instead of `101`, because it looks for `./.formatter.exs` in the process cwd rather than `/tmp/mix_format_root/.formatter.exs`.
+
+27. Metadata issue - probably not a bug
+File: `lib/mix/lib/mix/utils.ex:255-265`
+`Mix.Utils.last_modified_and_size/1` warns that a future mtime is being "reset to now" and does call `File.touch(path, now)`, but it still returns the stale future `mtime` instead of the updated timestamp. The returned metadata therefore does not describe the file after the function mutates it.
+Repro:
+`elixir -e 'Application.ensure_all_started(:mix); path = Path.join(System.tmp_dir!(), "mix_mtime_bug"); File.write!(path, "x"); future = System.os_time(:second) + 3600; File.touch!(path, future); {returned, size} = Mix.Utils.last_modified_and_size(path); actual = File.stat!(path, time: :posix).mtime; IO.inspect({returned, actual, size})'`
+Observed output shows different timestamps, e.g. `{1776150983, 1776147383, 1}`: the function returned the old future mtime even though the file was touched back to `now`.
+
+28. Compilation issue - low priority
+File: `lib/mix/lib/mix/tasks/loadconfig.ex:33-39`
+`Mix.Tasks.Loadconfig.run/1` only handles `[]` and `[file]`. Passing extra arguments falls through the `case` and crashes with a raw `CaseClauseError` instead of producing a structured Mix usage error.
+Repro:
+`mix loadconfig config/config.exs extra.exs`
+Observed output starts with:
+`** (CaseClauseError) no case clause matching: ["config/config.exs", "extra.exs"]`
+
+29. Compilation issue - low priority
+File: `lib/mix/lib/mix/tasks/app.tree.ex:41-55`
+`Mix.Tasks.App.Tree.run/1` only handles zero or one positional argument after `OptionParser.parse!/2`. Passing two or more positional arguments falls through the `case` and crashes with a raw `CaseClauseError` instead of a normal Mix usage error.
+Repro:
+`mix app.tree foo bar`
+Observed output starts with:
+`** (CaseClauseError) no case clause matching: {[], ["foo", "bar"]}`
+
+30. Correctness issue
+File: `lib/iex/lib/iex/config.ex:207-211`, `lib/iex/lib/iex.ex:448-454`, `lib/iex/lib/iex/evaluator.ex:270-287`
+`IEx.configure/1` documents `dot_iex: String.t() | nil`, and the evaluator explicitly treats `nil` as the normal "search default .iex.exs locations" mode. But `IEx.Config.validate_option/1` only accepts binaries for `:dot_iex`, so `IEx.configure(dot_iex: nil)` crashes the config server instead of accepting a documented valid value.
+Repro:
+`elixir -e 'Application.ensure_all_started(:iex); IEx.configure(dot_iex: nil)'`
+Observed output includes:
+`GenServer IEx.Config terminating`
+and `** (ArgumentError) invalid configuration {:dot_iex, nil}`.
+
+31. Correctness issue
+File: `lib/iex/lib/iex/helpers.ex:117-118, 141-157`
+`IEx.Helpers.recompile/1` advertises `:ok | :error | :noop`, and the branch where the current working directory changed is a failure path, but it returns the value of `IO.puts/1` (`:ok`) instead of `:error`. Callers therefore get a success atom even though no recompilation happened.
+Repro:
+`mix run -e 'Application.ensure_all_started(:iex); File.cd!(System.tmp_dir!()); IO.inspect(IEx.Helpers.recompile())'`
+Observed output prints `Cannot recompile because the current working directory changed` and then returns `:ok`.
+
+32. Correctness issue - NOT A BUG
+File: `lib/iex/lib/iex/helpers.ex:619-629, 631-632, 648`
+`IEx.Helpers.runtime_info/1` validates single-atom input against the supported topics list, but the list form accepts any list and forwards each element to `print_runtime_info_topic/1`. Invalid list entries therefore crash with a raw `FunctionClauseError` instead of being rejected consistently.
+Repro:
+`elixir -e 'Application.ensure_all_started(:iex); IEx.Helpers.runtime_info([:bad])'`
+Observed output starts with:
+`** (FunctionClauseError) no function clause matching in IEx.Helpers.print_runtime_info_topic/1`
+
+33. Correctness issue - fixed
+File: `lib/logger/lib/logger.ex:723-725, 739-744`, `lib/logger/lib/logger/app.ex:119-130`
+`Logger.configure/1` documents that its changes are persisted to the `:logger` application environment, but `:level` is handled only through `:logger.set_primary_config/2` and is never written with `Application.put_env/3`. As a result, the configured level is lost on logger restart.
+Repro:
+`elixir -e 'Application.ensure_all_started(:logger); Application.delete_env(:logger, :level); IO.inspect({:before, Application.get_env(:logger, :level)}); Logger.configure(level: :error); IO.inspect({:after_configure, Logger.level(), Application.get_env(:logger, :level)}); Logger.App.stop(); Application.start(:logger); IO.inspect({:after_restart, Logger.level(), Application.get_env(:logger, :level)})'`
+Observed output:
+`{:before, nil}`
+`{:after_configure, :error, nil}`
+`{:after_restart, :debug, nil}`
+
+34. Metadata issue - fixed
+File: `lib/logger/lib/logger.ex:752-758`
+The deprecation warning emitted from `Logger.configure/1` says `Logger.configure/2 is deprecated`, but the public API being called is `Logger.configure/1`. The diagnostic therefore points users at a nonexistent arity.
+Repro:
+`elixir -e 'Application.ensure_all_started(:logger); Logger.configure(sync_threshold: 1)'`
+Observed warning starts with:
+`warning: setting :sync_threshold in Logger.configure/2 is deprecated`
+
+35. Correctness issue - not a bug
+File: `lib/logger/lib/logger/formatter.ex:439-445, 457-458`
+`Logger.Formatter.compile/1` converts `$name` fragments with `String.to_atom/1` before validating them. For an invalid token, it then raises, but the atom has already been interned permanently. Repeated bad inputs therefore leak atoms into the VM atom table.
+Repro:
+`elixir -e 'name = "notexistingformatpattern"; before = try do {:present, String.to_existing_atom(name)} rescue ArgumentError -> :missing end; result = try do Logger.Formatter.compile("$" <> name) rescue e -> {e.__struct__, Exception.message(e)} end; after_ = try do {:present, String.to_existing_atom(name)} rescue ArgumentError -> :missing end; IO.inspect({before, result, after_})'`
+Observed output:
+`{:missing, {ArgumentError, "$notexistingformatpattern is an invalid format pattern"}, {:present, :notexistingformatpattern}}`
+
+36. Metadata issue - fixed
+File: `lib/eex/lib/eex/compiler.ex:344-350`, `lib/eex/lib/eex/engine.ex:218-220`
+Unsupported `<%/ %>` and `<%| %>` errors lose all template location metadata. `EEx.Compiler` has the exact `file/line/column` for the tag, but `handle_expr/3` only passes the marker and AST to the engine. The default engine then raises `EEx.SyntaxError` with only a message string, so `file`, `line`, `column`, and `snippet` are all `nil`.
+Repro:
+`elixir -e 'try do EEx.compile_string("<%/ true %>", file: "sample.eex", line: 7) rescue e in EEx.SyntaxError -> IO.inspect(Map.take(e, [:file, :line, :column, :snippet, :message])); IO.puts(Exception.message(e)) end'`
+Observed output:
+`%{file: nil, line: nil, column: nil, snippet: nil, message: "unsupported EEx syntax <%/ %> (the syntax is valid but not supported by the current EEx engine)"}`
+and the printed message has no `sample.eex:7:...` prefix.
+
+37. Compilation issue - not a bug
+File: `lib/eex/lib/eex.ex:156-166`, `lib/eex/lib/eex.ex:199-210`
+`EEx.function_from_string/5` and `EEx.function_from_file/5` document `kind` as `:def | :defp`, but the generated quoted code uses `case kind do` with no fallback. Invalid input therefore leaks a raw `CaseClauseError` during compilation instead of a structured argument/compile error.
+Repro:
+`elixir -e 'try do Code.compile_string("defmodule M do\n  require EEx\n  EEx.function_from_string(:bad, :t, \"ok\")\nend\n", "caller.ex") rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output starts with:
+`** (CaseClauseError) no case clause matching: :bad`
+
+38. Compilation issue - low priority
+File: `lib/eex/lib/eex.ex:111-126`, `lib/eex/lib/eex.ex:357-362`, `lib/eex/lib/eex/compiler.ex:24-29`
+`EEx.tokenize/2` publicly documents `:line`, `:column`, and `:indentation` as non-negative integers and advertises `{:ok, tokens} | {:error, ...}` behavior, but it does not validate those options. Negative values are accepted into returned token metadata, while non-integers crash with raw arithmetic errors.
+Repro:
+`elixir -e 'IO.inspect(EEx.tokenize("x", line: -1)); try do EEx.tokenize("x", column: :foo) rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output:
+`{:ok, [{:text, ~c"x", %{line: -1, column: 1}}, {:eof, %{line: -1, column: 2}}]}`
+and then:
+`** (ArithmeticError) bad argument in arithmetic expression`
+
+39. Correctness issue - low priority
+File: `lib/ex_unit/lib/ex_unit.ex:529-532`, `lib/ex_unit/lib/ex_unit/runner.ex:68-71`
+`ExUnit.after_suite/1` documents and types its callback as a single-arity function, but it only validates `is_function/1`. Arity-0/2/etc callbacks are therefore accepted up front and crash only after the suite finishes, when the runner unconditionally invokes each callback as `callback.(stats)`.
+Repro:
+`elixir -e 'ExUnit.start(autorun: false); ExUnit.after_suite(fn -> :ok end); try do ExUnit.run() rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output finishes the suite and then raises:
+`** (BadArityError) ... with arity 0 called with 1 argument`
+
+40. Correctness issue - PR submitted
+File: `lib/ex_unit/lib/ex_unit/capture_log.ex:46-49, 79-82`, `lib/ex_unit/lib/ex_unit/capture_server.ex:77-80`
+`ExUnit.CaptureLog.capture_log_opts` publicly allows `formatter: nil`, but `ExUnit.CaptureServer` destructures the formatter option as a `{module, config}` tuple with no `nil` handling. Passing the documented/typed `nil` value therefore crashes the capture server with a raw `MatchError`.
+Repro:
+`elixir -e 'Application.ensure_all_started(:logger); ExUnit.start(autorun: false); try do ExUnit.CaptureLog.with_log([formatter: nil], fn -> require Logger; Logger.error("x") end) rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output includes:
+`GenServer ExUnit.CaptureServer terminating`
+and `** (MatchError) no match of right hand side value: nil`.
+
+41. Correctness issue - FIXED
+File: `lib/elixir/lib/module/types/descr.ex:4903-4907, 4915-4937`
+`Module.Types.Descr.tuple/1` and `open_tuple/2` drop the static part of gradual element types. When an element has both static and dynamic components, `tuple_descr/3` keeps only the `:dynamic` part and returns a dynamic-only tuple type, erasing definitely-known static tuples.
+Repro:
+`elixir -e 'Code.compile_file("/Users/lukaszsamson/elixir/lib/elixir/lib/module/types/descr.ex"); import Module.Types.Descr; x = union(atom([:ok]), dynamic(integer())); t = tuple([x, atom([:x])]); IO.inspect(t); IO.inspect(subtype?(tuple([atom([:ok]), atom([:x])]), t))'`
+Observed output shows a dynamic-only tuple:
+`%{dynamic: %{tuple: {:closed, [%{atom: {:union, %{ok: []}}, bitmap: 8}, %{atom: {:union, %{x: []}}}]}}}`
+and `subtype?/2` returns `false`, even though `{:ok, :x}` is clearly included by the input element types.
+
+42. Correctness issue - FIXED
+File: `lib/elixir/lib/module/types/descr.ex:2774-2795, 2823-2833`
+`Module.Types.Descr.closed_map/1` and `open_map/1` drop the static part of gradual field values. `map_descr_pairs/4` rewrites gradual field values to only their `:dynamic` part, and `map_descr/2` then wraps the whole result as a dynamic-only map type.
+Repro:
+`elixir -e 'Code.compile_file("/Users/lukaszsamson/elixir/lib/elixir/lib/module/types/descr.ex"); import Module.Types.Descr; x = union(atom([:ok]), dynamic(integer())); m = closed_map(a: x); IO.inspect(m); IO.inspect(subtype?(closed_map(a: atom([:ok])), m))'`
+Observed output is:
+`%{dynamic: %{map: {:closed, [a: %{atom: {:union, %{ok: []}}, bitmap: 8}]}}}`
+and `subtype?/2` returns `false`, even though `%{a: :ok}` should remain in the constructed type.
+
+43. Correctness issue - FIXED
+File: `lib/elixir/lib/module/types/descr.ex:2132-2171, 2219-2225`
+`Module.Types.Descr.list/1` and `non_empty_list/2` drop the static part of gradual head/tail types. `list_pop_dynamic/1` strips a gradual component down to only its `:dynamic` part, and `list_descr/3` returns a dynamic-only list whenever either side was gradual.
+Repro:
+`elixir -e 'Code.compile_file("/Users/lukaszsamson/elixir/lib/elixir/lib/module/types/descr.ex"); import Module.Types.Descr; x = union(atom([:ok]), dynamic(integer())); l = non_empty_list(x); IO.inspect(l); IO.inspect(subtype?(non_empty_list(atom([:ok])), l))'`
+Observed output is:
+`%{dynamic: %{list: {%{atom: {:union, %{ok: []}}, bitmap: 8}, %{bitmap: 4}}}}`
+and `subtype?/2` returns `false`, even though a non-empty list whose head is definitely `:ok` should remain in the constructed type.
+
+Here's the triage of the 43 issues in comp_issues.txt:                                                                                                                                                       
+                                                                                                                                                                                                               
+  ---                                                                                                                                                                                                          
+  TIER 1 — Real bugs with user-visible impact                                                                                                                                                                  
+                                                                                                                                                                                                               
+  ┌─────┬─────────────────────┬────────────────────────────────────────────────────────────────────────────┬──────────────────────────────────────────────┐
+  │  #  │        Area         │                                  Summary                                   │                   Severity                   │                                                    
+  ├─────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤
+  │ 11  │ elixir_erl_for.erl  │ for...into: halt callback gets stale accumulator, loses collected values   │ High — data loss on exception                │                                                    
+  ├─────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤
+  │ 24  │ enum.ex             │ Enum.into halt callback same stale accumulator bug                         │ High — same root cause as #11                │                                                    
+  ├─────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                                    
+  │ 25  │ stream.ex           │ Stream.into same stale accumulator bug                                     │ High — same root cause                       │                                                    
+  ├─────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                                    
+  │ 18  │ kernel.ex           │ to_timeout(Duration.new!(second: -1)) returns -1000, violating spec        │ High — silent bad value passed to timer APIs │
+  ├─────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                                    
+  │ 41  │ descr.ex            │ tuple/1 drops static part of gradual types, subtype? gives wrong answer    │ High — type system unsoundness               │
+  ├─────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                                    
+  │ 42  │ descr.ex            │ closed_map/1 same static-part-dropping bug                                 │ High — type system unsoundness               │
+  ├─────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                                    
+  │ 43  │ descr.ex            │ list/1, non_empty_list/2 same static-part-dropping bug                     │ High — type system unsoundness               │
+  ├─────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                                    
+  │ 1   │ elixir_expand.erl   │ Spurious undefined-function warning for runtime-defined modules            │ Medium — false warning                       │
+  ├─────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                                    
+  │ 14  │ elixir_compiler.erl │ Compiler modules leaked on eval exception, never returned to pool          │ Medium — resource leak                       │
+  ├─────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                                    
+  │ 33  │ logger.ex           │ Logger.configure(level: :error) not persisted to app env, lost on restart  │ Medium — config silently reverts             │
+  ├─────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                                    
+  │ 30  │ iex/config.ex       │ IEx.configure(dot_iex: nil) crashes config server despite being documented │ Medium — crashes on valid input              │
+  ├─────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                                    
+  │ 22  │ system.ex           │ System.cmd doesn't reject NUL bytes in args — silently truncated           │ Medium — security-adjacent silent truncation │
+  └─────┴─────────────────────┴────────────────────────────────────────────────────────────────────────────┴──────────────────────────────────────────────┘                                                    
+                                                                        
+  TIER 2 — Edge-case crashes / incorrect behavior                                                                                                                                                              
+                                                                        
+  ┌─────┬─────────────────────────┬───────────────────────────────────────────────────────────────────────┐                                                                                                    
+  │  #  │          Area           │                                Summary                                │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ 4   │ elixir_import.erl       │ import :erlang_mod, only: :sigils crashes with UndefinedFunctionError │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ 6   │ elixir_quote.erl        │ quote line: -1 accepted then crashes later in erl_anno                │                                                                                                    
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 8   │ elixir_module.erl       │ Malformed @compile {:inline, [:foo]} crashes format_error             │                                                                                                    
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 10  │ elixir_erl_pass.erl     │ nil.foo in guard gives wrong error vs x.foo for nil                   │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 12  │ elixir_erl.erl          │ column: 0 or column: -1 in metadata crashes erl_anno                  │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 17  │ elixir.erl              │ Code.string_to_quoted!("1", column: :foo) crashes in arithmetic       │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 2   │ elixir_expand.erl       │ Non-list opts in multi-alias crashes with raw badarg                  │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 31  │ iex/helpers.ex          │ recompile() returns :ok on cwd-changed failure path                   │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 32  │ iex/helpers.ex          │ runtime_info([:bad]) crashes with FunctionClauseError                 │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 37  │ eex.ex                  │ function_from_string(:bad, ...) leaks CaseClauseError                 │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 38  │ eex/compiler.ex         │ EEx.tokenize("x", column: :foo) crashes in arithmetic                 │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 39  │ ex_unit.ex              │ after_suite(fn -> :ok end) accepted, crashes after suite runs         │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 40  │ capture_log.ex          │ capture_log([formatter: nil], ...) crashes capture server             │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 28  │ mix/tasks/loadconfig.ex │ Extra args → CaseClauseError                                          │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 29  │ mix/tasks/app.tree.ex   │ Extra args → CaseClauseError                                          │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 35  │ logger/formatter.ex     │ compile("$bad") leaks atoms before raising                            │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 26  │ mix/tasks/format.ex     │ :root option ignored when :dot_formatter given explicitly             │
+  ├─────┼─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                                    
+  │ 21  │ io.ex                   │ Deprecated IO.read(:stdio, :all) checks getopts on wrong device       │
+  └─────┴─────────────────────────┴───────────────────────────────────────────────────────────────────────┘                                                                                                    
+                                                                        
+  TIER 3 — Metadata/diagnostic issues (wrong locations, messages)                                                                                                                                              
+                                                                        
+  ┌─────┬──────────────────────┬────────────────────────────────────────────────────────────────────────────┐                                                                                                  
+  │  #  │         Area         │                                  Summary                                   │
+  ├─────┼──────────────────────┼────────────────────────────────────────────────────────────────────────────┤                                                                                                  
+  │ 3   │ elixir_bitstring.erl │ BitstrMeta replaced by element meta → wrong line in errors                 │
+  ├─────┼──────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ 5   │ elixir_import.erl    │ Error message omits :sigils as valid :only option                          │                                                                                                  
+  ├─────┼──────────────────────┼────────────────────────────────────────────────────────────────────────────┤                                                                                                  
+  │ 7   │ elixir_dispatch.erl  │ Ambiguous import always says "function" even for macros                    │                                                                                                  
+  ├─────┼──────────────────────┼────────────────────────────────────────────────────────────────────────────┤                                                                                                  
+  │ 9   │ elixir_module.erl    │ @on_load/@dialyzer/@nifs errors reported at module line not attribute line │
+  ├─────┼──────────────────────┼────────────────────────────────────────────────────────────────────────────┤                                                                                                  
+  │ 13  │ elixir_erl.erl       │ Optional-callback errors reported at module line not attribute line        │
+  ├─────┼──────────────────────┼────────────────────────────────────────────────────────────────────────────┤                                                                                                  
+  │ 15  │ elixir.erl           │ Duplicate synthetic stacktrace frames in nested eval                       │
+  ├─────┼──────────────────────┼────────────────────────────────────────────────────────────────────────────┤                                                                                                  
+  │ 16  │ elixir.erl           │ static_atoms_encoder doesn't receive file metadata                         │
+  ├─────┼──────────────────────┼────────────────────────────────────────────────────────────────────────────┤                                                                                                  
+  │ 19  │ kernel/typespec.ex   │ False record/0 overriding built-in warning on OTP where it's not built-in  │
+  ├─────┼──────────────────────┼────────────────────────────────────────────────────────────────────────────┤                                                                                                  
+  │ 20  │ protocol.ex          │ @optional_callbacks warning reported at protocol line not attribute line   │
+  ├─────┼──────────────────────┼────────────────────────────────────────────────────────────────────────────┤                                                                                                  
+  │ 23  │ system.ex            │ Doc says C:\TMP fallback but code only checks /tmp                         │
+  ├─────┼──────────────────────┼────────────────────────────────────────────────────────────────────────────┤                                                                                                  
+  │ 27  │ mix/utils.ex         │ last_modified_and_size returns stale mtime after touching file             │
+  ├─────┼──────────────────────┼────────────────────────────────────────────────────────────────────────────┤                                                                                                  
+  │ 34  │ logger.ex            │ Deprecation warning says Logger.configure/2 but function is /1             │
+  ├─────┼──────────────────────┼────────────────────────────────────────────────────────────────────────────┤                                                                                                  
+  │ 36  │ eex/compiler.ex      │ <%/ %> error loses all file/line/column metadata                           │
+  └─────┴──────────────────────┴────────────────────────────────────────────────────────────────────────────┘                                                                                                  
+                                                                        
+  ---                                                                                                                                                                                                          
+  Top 5 most impactful:                                                 
+  1. #11/#24/#25 — Collectable halt gets stale accumulator (same root cause, data loss)                                                                                                                        
+  2. #41/#42/#43 — Type system drops static parts of gradual types (unsound)           
+  3. #18 — to_timeout returns negative for Duration, violating spec                                                                                                                                            
+  4. #14 — Compiler module leak on eval exceptions                                                                                                                                                             
+5. #33 — Logger level not persisted, silently reverts on restart
+
+44. Correctness issue
+File: `lib/elixir/lib/io/ansi/docs.ex:108-109, 364-369, 585-599, 614-620`
+`IO.ANSI.Docs` counts only 3-byte and 4-byte SGR escapes when measuring visible width. Valid ANSI sequences generated by the public color API such as `IO.ANSI.color/1` (`"\e[38;5;196m"`) are longer, so they are counted as printable characters. As a result, docs rendering wraps too early and miscomputes layout when users configure IEx doc colors with extended ANSI colors, even though `IEx` explicitly types/documents these color options as `IO.ANSI.ansidata()`.
+Repro:
+`elixir -e 'Code.require_file("lib/elixir/lib/io/ansi.ex"); Code.require_file("lib/elixir/lib/io/ansi/docs.ex"); md = "word `two`\n"; opts = [enabled: true, width: 10, doc_inline_code: [IO.ANSI.color(196)]]; out = ExUnit.CaptureIO.capture_io(fn -> IO.ANSI.Docs.print(md, "text/markdown", opts) end); IO.puts(:erlang.iolist_to_binary(out))'`
+Observed output wraps after `word` and prints inline code on the next line:
+`word`
+`\e[38;5;196mtwo\e[0m`
+even though the visible text `word two` fits within width 10. The root cause is `length_without_escape/2`, which only strips `\e[<1><1>m` and `\e[<1><1><1>m` forms.
+
+45. Correctness issue
+File: `lib/elixir/lib/io/ansi/docs.ex:283-289, 324-345`
+The Markdown ordered-list parser only recognizes one- and two-digit markers. Items starting at `100.` or higher are not treated as list entries and instead collapse into plain paragraph text.
+Repro:
+`elixir -e 'Code.require_file("lib/elixir/lib/io/ansi.ex"); Code.require_file("lib/elixir/lib/io/ansi/docs.ex"); md = "100. one hundred\n101. one-oh-one\n"; out = ExUnit.CaptureIO.capture_io(fn -> IO.ANSI.Docs.print(md, "text/markdown", [enabled: false]) end); IO.puts(:erlang.iolist_to_binary(out) |> inspect())'`
+Observed output is:
+`"100. one hundred 101. one-oh-one\n\n"`
+instead of preserving the ordered list as separate list items. The parser has explicit matches for `d1.` and `d1d2.` only, with no general case for longer decimal markers.
+
+46. Correctness issue
+File: `lib/elixir/lib/code/fragment.ex:1270-1279`
+`Code.Fragment.container_cursor_to_quoted/2` silently drops its documented `:file`, `:line`, and `:column` options. The function strips the option list down to `[:columns, :token_metadata, :literal_encoder]` before reading those values back, so tokenization and returned AST metadata always behave as if the input started at `nofile:1:1`.
+Repro:
+`elixir -e 'IO.inspect(Code.Fragment.container_cursor_to_quoted("foo(", file: "sample.ex", line: 10, column: 3, columns: true))'`
+Observed output is:
+`{:ok, {:foo, [line: 1, column: 1], [{:__cursor__, [line: 1, column: 5], []}]}}`
+instead of using the caller-supplied starting location. Parse errors also report the wrong location for the same reason, e.g. `Code.Fragment.container_cursor_to_quoted("1 + *", file: "sample.ex", line: 10, column: 3)` returns `{:error, {[line: 1, column: 5], ...}}`.
+
+47. Compilation issue - LOW PRIORITY/NOT A BUG
+File: `lib/elixir/lib/code.ex:1434-1443, 1472-1493`
+`Code.string_to_quoted_with_comments/2` is not reentrant in a single process. It stores comment state in the process dictionary under `:code_formatter_comments` without saving/restoring any previous value, so a nested call from tokenizer callbacks (such as the documented `:static_atoms_encoder`) clobbers the outer parser state. When the outer parse later sees a comment, `Process.get(:code_formatter_comments)` is `nil` and `last_comment_distance/2` crashes with a raw `FunctionClauseError`.
+Repro:
+`elixir -e 'encoder = fn atom, _meta -> if atom == "foo", do: Code.string_to_quoted_with_comments!(":inner # c"); {:ok, String.to_atom(atom)} end; Code.string_to_quoted_with_comments(":foo\n# outer\n:bar", static_atoms_encoder: encoder)'`
+Observed output crashes with:
+`** (FunctionClauseError) no function clause matching in Code.last_comment_distance/2`
+from `lib/code.ex:1492`, instead of returning the outer AST/comments.
+
+48. Correctness issue
+File: `lib/elixir/lib/code/fragment.ex:722-736, 1037-1058`
+`Code.Fragment.surround_context/3` does not reject out-of-range line numbers. If the requested `line` is past the end of the input, `split_at/3` falls back to the last line and the function returns a context tagged with the nonexistent requested line number instead of `:none`.
+Repro:
+`elixir -e 'IO.inspect(Code.Fragment.surround_context("hello", {20, 1}))'`
+Observed output is:
+`%{context: {:local_or_var, ~c"hello"}, begin: {20, 1}, end: {20, 6}}`
+even though line 20 does not exist in the source. For comparison, the same API already returns `:none` for out-of-range columns on an existing line.
+
+49. Correctness issue - not a bug
+File: `lib/elixir/lib/task.ex:1241-1253, 1267-1276, 1290-1300`
+`Task.yield_many/2` documents `limit: pos_integer()` and `on_timeout: :nothing | :ignore | :kill_task`, but it never validates either option. Invalid values therefore leak into the internal control flow and crash with raw exceptions instead of being rejected like other Task APIs.
+Repro:
+`elixir -e 'task = %Task{ref: make_ref(), owner: self(), pid: nil, mfa: {Task, :yield_many, 2}}; try do Task.yield_many([task], timeout: 0, on_timeout: :bogus) rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end; send(self(), {task.ref, :ok}); try do Task.yield_many([task], limit: "x", timeout: :infinity) rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output crashes with:
+`** (CaseClauseError) no case clause matching: :bogus`
+from `lib/task.ex:1271`, and then:
+`** (ArithmeticError) bad argument in arithmetic expression`
+from `:erlang.-("x", 1)` via `lib/task.ex:1294`.
+Negative limits are worse: `Task.yield_many([task], limit: -1, timeout: :infinity)` can block forever waiting for a timeout message that will never arrive. This is inconsistent with the documented types and with `Task.async_stream/3`, which validates `:on_timeout` eagerly and raises a clear `ArgumentError` for invalid values.
+
+50. Correctness issue - FIXED
+File: `lib/elixir/lib/path.ex:484-489`
+`Path.relative_to_cwd/2` promises a binary result, but its cwd-failure fallback returns the original `path` term unchanged. If the caller passes a charlist and the current working directory can no longer be retrieved, the function returns a charlist instead of a binary.
+Repro:
+`elixir -e 'tmp = Path.join(System.tmp_dir!(), "path_rel_deleted_") <> Integer.to_string(System.unique_integer([:positive])); File.mkdir_p!(tmp); File.cd!(tmp, fn -> File.rm_rf!(tmp); IO.inspect(:file.get_cwd()); result = Path.relative_to_cwd(~c"foo/bar"); IO.inspect(result); IO.inspect(is_list(result)); IO.inspect(Path.relative_to_cwd("foo/bar")) end)'`
+Observed output is:
+`{:error, :enoent}`
+`~c"foo/bar"`
+`true`
+`"foo/bar"`
+So the same API returns different types on the error path depending on whether the original input was binary or charlist, even though the public `@spec` is always `binary` and the success path normalizes through `relative_to/3`.
+
+51. Correctness issue - not a bug
+File: `lib/elixir/lib/file.ex:1019-1023, 1055-1063, 1143-1147, 1198-1223, 1362-1378, 1392-1402`
+`File.cp/3` and `File.cp_r/3` document `:on_conflict` as a boolean callback, but they treat any truthy return value as permission to overwrite. Accidental non-boolean returns such as `:ok` therefore overwrite files silently instead of being rejected.
+Repro:
+`elixir -e 'tmp = Path.join(System.tmp_dir!(), "file_cp_truthy_") <> Integer.to_string(System.unique_integer([:positive])); src = Path.join(tmp, "src"); dest = Path.join(tmp, "dest"); File.mkdir_p!(Path.join(src, "a")); File.mkdir_p!(Path.join(dest, "a")); File.write!(Path.join(src, "a/1.txt"), "new"); File.write!(Path.join(dest, "a/1.txt"), "old"); IO.inspect(File.cp_r(src, dest, on_conflict: fn _, _ -> :ok end)); IO.inspect(File.read!(Path.join(dest, "a/1.txt"))); File.rm_rf!(tmp)'`
+Observed output is `{:ok, [...dest/a/1.txt, ...]}` and then `"new"`: returning `:ok` from the callback overwrites the destination even though the docs and callback type say the function should return `true` or `false`.
+The same happens in `File.cp/3`:
+`elixir -e 'tmp = Path.join(System.tmp_dir!(), "file_cp_badcb_") <> Integer.to_string(System.unique_integer([:positive])); src = Path.join(tmp, "src.txt"); dest = Path.join(tmp, "dest.txt"); File.mkdir_p!(tmp); File.write!(src, "new"); File.write!(dest, "old"); IO.inspect(File.cp(src, dest, on_conflict: fn _, _ -> :ok end)); IO.inspect(File.read!(dest)); File.rm_rf!(tmp)'`
+prints `:ok` and then `"new"`.
+
+52. Correctness issue - not a bug
+File: `lib/elixir/lib/task.ex:1308-1316, 1336-1363`
+`Task.shutdown/2` does not validate its second argument consistently. The docs and spec say it must be a timeout or `:brutal_kill`, but completed tasks (`pid: nil`) accept any term and ignore it, while live tasks crash with a raw `FunctionClauseError` instead of a clean argument error.
+Repro:
+`elixir -e 'task = %Task{ref: ref = make_ref(), owner: self(), pid: nil, mfa: {Task, :shutdown, 2}}; send(self(), {ref, :done}); IO.inspect(Task.shutdown(task, :bogus)); task2 = Task.async(fn -> :done end); Process.sleep(10); for arg <- [:bogus, -1] do try do IO.inspect(Task.shutdown(task2, arg)) rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end end'`
+Observed output first prints `{:ok, :done}` for the invalid argument on the completed task, then both invalid arguments on the live task crash with:
+`** (FunctionClauseError) no function clause matching in Task.shutdown/2`
+This makes invalid input succeed or crash depending only on the task state, even though the public contract for the argument is the same in both cases.
+
+53. Correctness issue - not a bug
+File: `lib/elixir/lib/string.ex:423-428, 522-525, 542-559, 562-563`
+`String.split/3` documents `:parts` as a positive integer or `:infinity` and `:trim` as a boolean, but it does not validate either option. Invalid `:parts` values crash with a raw `FunctionClauseError`, while invalid `:trim` values are silently treated as truthy or falsey instead of being rejected.
+Repro:
+`elixir -e 'for expr <- [fn -> String.split("a b", " ", parts: 0) end, fn -> String.split("a b", " ", parts: -1) end, fn -> String.split("a b", " ", parts: :bad) end, fn -> String.split("a b", " ", trim: :bad) end] do try do IO.inspect(expr.()) rescue e -> IO.puts("---"); IO.puts(Exception.format(:error, e, __STACKTRACE__)) end end'`
+Observed output crashes three times with:
+`** (FunctionClauseError) no function clause matching in String.parts_to_index/1`
+from `lib/string.ex:562`, and then returns `[`"a"`, `"b"`]` for `trim: :bad` as if `:trim` had been set to `true`.
+This is inconsistent with the documented option types and leaves malformed public input either crashing through a private helper or changing behavior silently.
+
+54. Correctness issue - low priority/not a bug
+File: `lib/elixir/lib/enum.ex:4201-4206, 4273-4277`
+`Enum.zip_with/2` validates its reducer only after it has confirmed there is at least one zipped row. If the input enumerable-of-enumerables is already empty, or all inner enumerables are empty, a non-function reducer is accepted and the function returns `[]` instead of rejecting invalid input. The same invalid reducer on non-empty input raises `BadFunctionError`.
+Repro:
+`elixir -e 'IO.inspect(Enum.zip_with([], :bad)); IO.inspect(Enum.zip_with([[]], :bad)); IO.inspect(Enum.zip_with(%{}, :bad)); try do Enum.zip_with([[1]], :bad) rescue e -> IO.puts(Exception.format(:error, e, __STACKTRACE__)) end'`
+Observed output is:
+`[]`
+`[]`
+`[]`
+followed by:
+`** (BadFunctionError) expected a function, got: :bad`
+for the non-empty case.
+`Stream.zip_with/2` does not have this state-dependent hole: `Stream.zip_with([], :bad) |> Enum.to_list()` already fails immediately. So `Enum.zip_with/2` accepts invalid reducer input only when the zipped data happens to be empty.
+
+55. Compiler correctness issue - reported
+File: `lib/elixir/src/elixir_rewrite.erl:250-278`
+Several rewrite rules reorder Elixir call arguments when lowering to Erlang BIFs, and the generated code evaluates side-effecting argument expressions in the rewritten order instead of the source order. Direct calls therefore behave differently from equivalent captured calls.
+Repro:
+`elixir -e 'p=self(); Process.send_after((send(p,:dest); p), (send(p,:msg); :hello), (send(p,:time); 10)); for _ <- 1..3, do: receive do x -> IO.inspect(x) end; p=self(); f=&Process.send_after/3; f.((send(p,:dest); p), (send(p,:msg); :hello), (send(p,:time); 10)); for _ <- 1..3, do: receive do x -> IO.inspect(x) end'`
+Observed output is:
+`:time`
+`:dest`
+`:msg`
+`:dest`
+`:msg`
+`:time`
+The direct call is rewritten from `Process.send_after(dest, msg, time)` to `:erlang.send_after(time, dest, msg)` by line 267, so `time` runs first. The captured call preserves the source order.
+The same root cause shows up in other rules:
+`elixir -e 'p=self(); elem((send(p,:tuple); {:a}), (send(p,:idx); 0)); for _ <- 1..2, do: receive do x -> IO.inspect(x) end; p=self(); f=&Kernel.elem/2; f.((send(p,:tuple); {:a}), (send(p,:idx); 0)); for _ <- 1..2, do: receive do x -> IO.inspect(x) end'`
+prints `:idx, :tuple` for the direct call but `:tuple, :idx` for the captured call because line 275 rewrites to `:erlang.element(index + 1, tuple)`.
+`elixir -e 'p=self(); Tuple.duplicate((send(p,:data); :x), (send(p,:size); 2)); for _ <- 1..2, do: receive do x -> IO.inspect(x) end; p=self(); f=&Tuple.duplicate/2; f.((send(p,:data); :x), (send(p,:size); 2)); for _ <- 1..2, do: receive do x -> IO.inspect(x) end'`
+prints `:size, :data` for the direct call but `:data, :size` for the captured call because line 269 rewrites to `:erlang.make_tuple(size, data)`.
+Other affected rules include `Kernel.is_map_key/2`, `Map.has_key?/2`, `Map.fetch/2`, `Map.fetch!/2`, `Map.delete/2`, `Map.replace!/3`, `Process.group_leader/2`, `Tuple.delete_at/2`, `Tuple.insert_at/3`, and `Kernel.put_elem/3`. `Map.put/3` is partially masked by the later `maps:put` map-update optimization, but the generic rewrite mechanism is still unsafe for reordered arguments unless it introduces temporaries in source order.
+
+56. Compiler correctness issue - fixed
+File: `lib/elixir/src/elixir_erl_pass.erl:579-590`
+The special backend translation for `:maps.put/3` rewrites a source-order function call `:maps.put(key, value, map)` into Erlang map construction/update syntax. Erlang map syntax evaluates the map expression or existing map literal fields before the inserted key/value pair, so side-effecting arguments run in a different order from the source call.
+Repro:
+`elixir -e 'p=self(); :maps.put((send(p,:key); :a), (send(p,:val); 1), (send(p,:map); %{})); Enum.each(1..3, fn _ -> receive do x -> IO.inspect(x) end end); p=self(); f=&:maps.put/3; f.((send(p,:key); :a), (send(p,:val); 1), (send(p,:map); %{})); Enum.each(1..3, fn _ -> receive do x -> IO.inspect(x) end end)'`
+Observed output is:
+`:map`
+`:key`
+`:val`
+`:key`
+`:val`
+`:map`
+The direct call evaluates the third argument first after the optimization, while the captured call preserves the source argument order.
+The literal-map branch has the same issue:
+`elixir -e 'p=self(); :maps.put((send(p,:key); :a), (send(p,:val); 1), %{(send(p,:map_key); :b) => (send(p,:map_val); 2)}); Enum.each(1..4, fn _ -> receive do x -> IO.inspect(x) end end)'`
+prints `:map_key, :map_val, :key, :val`, even though the source call should evaluate `key`, then `value`, then the map argument. The optimization needs temporaries in source order, or it must leave the call as `maps:put/3` when any reordered argument is not provably side-effect-free.
+
+57. Compiler correctness issue - not a bug
+File: `lib/elixir/lib/kernel/utils.ex:83-89`
+`Kernel.defdelegate/2` still accepts the deprecated `:append_first` option, but a zero-arity delegate with that option crashes the compiler helper with `tl([])`/`hd([])`. This is valid source syntax that gets as far as the deprecation warning, then fails with an internal `ArgumentError` from `Kernel.Utils.build_as_args/2` instead of either compiling as a no-op argument rearrangement or raising a targeted compiler error.
+Repro:
+`elixir -e 'defmodule DelegTarget do def foo(), do: :ok end; Code.compile_string("defmodule DelegBug do\n  defdelegate foo(), to: DelegTarget, append_first: true\nend")'`
+Observed output first warns:
+`warning: Kernel.defdelegate/2 :append_first option is deprecated`
+and then crashes with:
+`** (ArgumentError) errors were found at the given arguments:
+
+  * 1st argument: not a nonempty list
+
+    :erlang.tl([])
+    (elixir 1.20.0-rc.4) lib/kernel/utils.ex:87: Kernel.Utils.build_as_args/2`
+The crash is caused by line 87 assuming `as_args` is non-empty for `append_first?: true`; zero-arity delegates produce `as_args == []`.
+
+58. Compiler correctness issue - fixed
+File: `lib/elixir/lib/kernel.ex:4701-4715`
+`Kernel.in/2` documents body-mode membership as translating to `Enum.member?(right, left)`, and the non-list fallback at line 4726 emits exactly that order. However, when the right-hand side is syntactically a proper list, lines 4711-4715 emit `:lists.member(left, right)`. Erlang evaluates function arguments left-to-right, so side-effecting or raising code in the left operand runs before expressions in the right-hand list, unlike both the documented translation and the dynamic-enumerable path.
+Repro:
+`elixir -e 'p=self(); ((send(p,:left); 2) in [(send(p,:r1); 1), (send(p,:r2); 2)]); msgs = for _ <- 1..5, reduce: [] do acc -> receive do x -> [x|acc] after 0 -> acc end end; IO.inspect(Enum.reverse(msgs)); p=self(); Enum.member?([(send(p,:r1); 1), (send(p,:r2); 2)], (send(p,:left); 2)); msgs = for _ <- 1..5, reduce: [] do acc -> receive do x -> [x|acc] after 0 -> acc end end; IO.inspect(Enum.reverse(msgs))'`
+Observed output is:
+`[:left, :r1, :r2]`
+`[:r1, :r2, :left]`
+The optimized `in` form evaluates the left operand first, while the documented `Enum.member?/2` translation evaluates the right-hand list first. This also changes which exception is raised first, for example `(raise "left") in [raise "right"]` raises `"left"` even though `Enum.member?([raise "right"], raise "left")` raises `"right"`.

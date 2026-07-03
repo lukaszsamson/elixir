@@ -1,0 +1,190 @@
+COMPILER_BUGS_FABLE.txt triage
+================================
+
+Environment checked
+-------------------
+
+- Repo: /Users/lukaszsamson/elixir
+- Branch: v1.20
+- Commit: 2beac7740
+- Runtime: Elixir 1.20.1, Erlang/OTP 28
+
+Summary
+-------
+
+All executable repros in COMPILER_BUGS_FABLE.txt were reproduced against the
+local build. The file is credible: the source references generally line up
+with observed behavior. The highest-value fixes are A1/C2, B1, B2, and B3.
+
+Recommended buckets:
+
+- Fix first: A1/C2, B1, B2, B3.
+- Fix next: A2, A3, A4, B4, B5, C1.
+- Low-risk cleanup or policy decision: B6, B7, C3.
+- Keep as notes only: D1, D2.
+
+Detailed triage
+---------------
+
+## A1 / C2: bitstring-generator reduce path stops instead of skips
+
+Status: Confirmed.
+Priority: High for A1, medium for C2.
+Source: lib/elixir/src/elixir_erl_for.erl:258-324.
+Observed: plain binary comprehension returned [1, 3], but reduce-path variants
+returned [1], %{1 => 1}, and [1] where later matches should survive.
+Disposition: One issue family. Fix literal abstract sizes first, then decide how
+far non-literal pinned sizes should be supported on the reduce path.
+Likely tests: lib/elixir/test/elixir/kernel/comprehension_test.exs.
+
+## A2: unquote_splicing in cons-tail position corrupts | AST
+
+Status: Confirmed.
+Priority: Medium.
+Source: lib/elixir/src/elixir_quote.erl:493-505.
+Observed: quote(do: [1 | unquote_splicing([2])]) produced [{:|, [], [1, 2]}]
+and evaluated to [1 | 2]. Multi-element splices later fail as bogus |/N calls.
+Disposition: Fix semantics if right-side splicing is intended; otherwise raise
+at quote time with the existing unquote_splicing context error. Silent improper
+list construction should not remain.
+Likely tests: lib/elixir/test/elixir/kernel/quote_test.exs.
+
+## A3: tap/2, then/2, is_struct/2, is_exception/2 evaluate second arg first
+
+Status: Confirmed behavior.
+Priority: Medium, with compatibility review.
+Source: lib/elixir/lib/kernel.ex:1403-1407, 2664-2678, 2787-2801, 2836-2839.
+Observed: side-effect logging showed fun/name evaluated before value/term.
+Disposition: Treat as a bug if Kernel macros that emulate calls must preserve
+left-to-right argument order. tap/2 can be fixed by bind_quoted order; then/2
+and the predicate macros need expansion shapes that force value/term first.
+Likely tests: lib/elixir/test/elixir/kernel/macros_test.exs or kernel_test.exs.
+
+## A4: destructure/2 discards cons-pattern tail
+
+Status: Confirmed.
+Priority: Medium-low.
+Source: lib/elixir/lib/kernel.ex:4157-4160.
+Observed: destructure([a, b | c], [1, 2, 3, 4, 5]) bound {a, b, c} to
+{1, 2, []}.
+Disposition: Either support cons patterns according to the docs or reject them
+at compile time. Current silent truncation is wrong.
+Likely tests: lib/elixir/test/elixir/kernel/macros_test.exs.
+
+## B1: quote with unquote rejected in match/guard contexts
+
+Status: Confirmed.
+Priority: High.
+Source: lib/elixir/src/elixir_quote.erl:349-353, plus match/guard expansion.
+Observed: a case pattern using quote(do: unquote(x) + 1) fails with
+"cannot invoke remote function :elixir_quote.unquote/1 inside a match".
+Disposition: Regression-quality issue. Validation wrappers need to avoid
+emitting illegal runtime remote calls in match/guard contexts, or this breaking
+change needs explicit policy and docs.
+Likely tests: lib/elixir/test/elixir/kernel/quote_test.exs and guard tests.
+
+## B2: valid unification across parallel match patterns rejected
+
+Status: Confirmed.
+Priority: High.
+Source: lib/elixir/src/elixir_clauses.erl:16-36 and 47-106.
+Observed: fn %{a: v} = %{b: v} -> v end fails as a recursive variable
+definition.
+Disposition: Fix cycle detection to distinguish same-variable leaf unification
+from genuine recursive definitions.
+Likely tests: lib/elixir/test/elixir/kernel/expansion_test.exs and fn_test.exs.
+
+## B3: default argument state leaks into sibling defaults and crashes compile
+
+Status: Confirmed.
+Priority: High.
+Source: lib/elixir/src/elixir_def.erl:297-317.
+Observed: def f(a \\ (x = 1), b \\ x) crashes type checking after generating
+def f(x1), do: super(x1, x).
+Disposition: Expand sibling defaults without carrying variable bindings from
+previous defaults. Expected result is a clean undefined-variable diagnostic for
+b \\ x.
+Likely tests: lib/elixir/test/elixir/kernel/defaults_test.exs.
+
+## B4: rebinding bitstring size variable earlier in same pattern gives internal error
+
+Status: Confirmed.
+Priority: Medium.
+Source: lib/elixir/src/elixir_expand.erl:451-468, bitstring size prematch path.
+Observed: pattern {len, <<x::size(len), _::bitstring>>} with outer len in scope
+fails with internal "unbound variable '_len@2'".
+Disposition: At minimum produce a front-end diagnostic with source location.
+If intended to mirror the rebound-after-binary case, use the pre-match variable
+and warn consistently.
+Likely tests: lib/elixir/test/elixir/kernel/binary_test.exs.
+
+## B5: defmodule unquote(mod).Sub fails in module body
+
+Status: Confirmed with separate macro definition/use files.
+Priority: Medium.
+Source: lib/elixir/lib/kernel.ex:5249-5258.
+Observed: top-level macro expansion defines DM.Inner, but the same macro call
+inside another module fails with invalid :as option for nested alias Elixir.DM.
+Disposition: Fix alias_defmodule for full Elixir.* atoms in nested alias ASTs.
+Likely tests: lib/elixir/test/elixir/kernel/alias_test.exs or macros_test.exs.
+
+## B6: nested quote option unquote differs between 2-arg and keyword-sugar forms
+
+Status: Confirmed.
+Priority: Low.
+Source: lib/elixir/src/elixir_quote.erl:328-347.
+Observed: quote([line: unquote(l)], do: foo()) works inside an outer quote;
+quote(line: unquote(l), do: foo()) leaves a dead unquote and fails later.
+Disposition: Either normalize keyword-sugar quote handling to the 2-arg behavior
+or reject unquote in nested quote options consistently.
+Likely tests: lib/elixir/test/elixir/kernel/quote_test.exs.
+
+## B7: Macro.escape improper list with unquote_splicing crashes
+
+Status: Confirmed.
+Priority: Low-medium.
+Source: lib/elixir/src/elixir_quote.erl:226-236.
+Observed: Macro.escape([1, splice | 4], unquote: true) raises
+FunctionClauseError in Macro.escape/2.
+Disposition: Return AST for [1, 2, 3 | 4] when possible, or raise a clean
+ArgumentError. Avoid leaking an internal FunctionClauseError.
+Likely tests: lib/elixir/test/elixir/macro_test.exs.
+
+## C1: generated metadata handling differs for remote macro dispatch
+
+Status: Confirmed.
+Priority: Medium.
+Source: lib/elixir/src/elixir_dispatch.erl:118-155.
+Observed: an imported macro path emitted the Integer.to_string(:atom) type
+warning; the equivalent remote macro path suppressed it. Also, imported/local
+macro args saw stop_generated: true in metadata while remote macro args did not.
+Disposition: dispatch_require should probably apply the same stop_generated
+treatment as dispatch_import, but the internal metadata leak should be checked
+when doing so.
+Likely tests: lib/elixir/test/elixir/kernel/warning_test.exs and
+lib/elixir/test/elixir/macro/env_test.exs.
+
+## C3: doubled warning prefix in @derive misuse
+
+Status: Confirmed.
+Priority: Trivial.
+Source: lib/elixir/lib/module.ex:1996-2006.
+Observed: warning output begins "warning: warning: module attribute @derive...".
+Disposition: Drop the hardcoded "warning: " prefix from the message passed to
+IO.warn/2.
+Likely tests: lib/elixir/test/elixir/module_test.exs.
+
+Notes
+-----
+
+D1 and D2 should stay as notes, not bug reports:
+
+- D1 is a dead/missed optimization path. Fixing only the arity would be unsafe.
+- D2 may be deliberate callback ordering and needs policy discussion before any
+  code change.
+
+Verification commands
+---------------------
+
+I reproduced the listed snippets with bin/elixir against temporary .exs files.
+No compiler source files were modified during triage.

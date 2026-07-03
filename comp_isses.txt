@@ -1,0 +1,407 @@
+## elixir_rewrite reorders arguments of inlined calls - FIXED
+
+Source: `lib/elixir/src/elixir_rewrite.erl:256-279`
+
+Several rewrite rules lower ordinary Elixir calls into Erlang BIF calls with a different argument order, for example `Map.put(map, key, value)` becomes `:maps.put(key, value, map)`, `elem(tuple, index)` becomes `:erlang.element(index + 1, tuple)`, and `Process.send_after(dest, msg, time)` becomes `:erlang.send_after(time, dest, msg)`. The arguments are expanded in source order before this rewrite in `elixir_expand:expand_remote/8`, but the generated Erlang call evaluates the reordered arguments. This makes direct calls observably different from an equivalent wrapper call for valid code with side effects or exceptions.
+
+Minimal reproducer:
+
+```elixir
+defmodule RewriteOrderRepro do
+  def mark(label, value) do
+    Process.put(:trace, Process.get(:trace, []) ++ [label])
+    value
+  end
+
+  def wrapped_put(map, key, value), do: Map.put(map, key, value)
+
+  def wrapped do
+    Process.put(:trace, [])
+    wrapped_put(mark(:map, %{}), mark(:key, :a), mark(:value, 1))
+    Process.get(:trace)
+  end
+
+  def direct do
+    Process.put(:trace, [])
+    Map.put(mark(:map, %{}), mark(:key, :a), mark(:value, 1))
+    Process.get(:trace)
+  end
+end
+
+IO.inspect({RewriteOrderRepro.wrapped(), RewriteOrderRepro.direct()})
+# Expected equivalent traces, but current output is:
+# {[:map, :key, :value], [:key, :value, :map]}
+```
+
+This is a semantic issue in the compiler rewrite, not invalid-code handling: the same valid call changes observable behavior solely because the compiler recognizes and rewrites it.
+
+## maps:merge/2 map-literal optimization evaluates RHS fields before a failing LHS map update finishes - NEED TO CHECK
+
+Source: `lib/elixir/src/elixir_rewrite.erl:160`, `lib/elixir/src/elixir_erl_pass.erl:617-628`
+
+`Map.merge/2` is first inlined to `:maps.merge/2`, and `translate_remote(maps, merge, ...)` then rewrites calls whose second argument is a map literal into Erlang map construction/update syntax. When the first argument is itself a map update, the optimizer combines both maps into one map update (`{map, _, InnerMap1, Pairs1}` plus literal pairs becomes `{map, Ann, InnerMap1, Pairs1 ++ Pairs2}`). That changes valid-code behavior: RHS literal values can run even though evaluating the first merge argument would have failed before the second merge argument was needed.
+
+Minimal reproducer:
+
+```elixir
+defmodule MergeUpdateRepro do
+  def mark(label, value) do
+    Process.put(:trace, Process.get(:trace, []) ++ [label])
+    value
+  end
+
+  def plain_merge(a, b), do: :maps.merge(a, b)
+
+  def plain(m) do
+    Process.put(:trace, [])
+
+    try do
+      plain_merge(%{m | a: mark(:left, 1)}, %{b: mark(:right, 2)})
+    rescue
+      e -> {e.__struct__, Process.get(:trace)}
+    end
+  end
+
+  def optimized(m) do
+    Process.put(:trace, [])
+
+    try do
+      Map.merge(%{m | a: mark(:left, 1)}, %{b: mark(:right, 2)})
+    rescue
+      e -> {e.__struct__, Process.get(:trace)}
+    end
+  end
+end
+
+IO.inspect({MergeUpdateRepro.plain(%{}), MergeUpdateRepro.optimized(%{})})
+# Expected equivalent behavior, but current output is:
+# {{KeyError, [:left]}, {KeyError, [:left, :right]}}
+```
+
+The optimized form still raises `KeyError`, but it has already evaluated the right-hand map literal value. That is observably different from the non-optimized merge call and can change side effects or the exception that escapes if the RHS raises.
+
+## Macro.expand/2 does not expand a required remote macro when the remote receiver is itself a macro expansion - NEED TO CHECK
+
+Source: `lib/elixir/lib/macro.ex:2021-2038`, `lib/elixir/lib/macro.ex:2265-2274`, compiler contrast in `lib/elixir/src/elixir_expand.erl:524-530`
+
+`Macro.expand/2` repeatedly calls `expand_once/2` on the root node until no more expansion is reported. For remote calls, `do_expand_once/2` first tries to expand the receiver, but it discards whether the receiver changed. If the expanded receiver is an atom but the final remote macro call is not expanded, the function returns `{original, false}`. That stops the outer expansion loop even though the receiver macro expansion would make the remote macro call resolvable. The compiler expansion path does not have this problem: it expands the left side, then dispatches the required macro call using the expanded receiver.
+
+Minimal reproducer:
+
+```elixir
+defmodule MacroExpandReceiverRepro.N do
+  defmacro foo(), do: quote(do: {:expanded, :ok})
+end
+
+defmodule MacroExpandReceiverRepro.M do
+  defmacro receiver(), do: quote(do: MacroExpandReceiverRepro.N)
+end
+
+defmodule MacroExpandReceiverRepro.Run do
+  require MacroExpandReceiverRepro.M
+  require MacroExpandReceiverRepro.N
+
+  def compiled, do: MacroExpandReceiverRepro.M.receiver().foo()
+
+  def expanded_string do
+    quote(do: MacroExpandReceiverRepro.M.receiver().foo())
+    |> Macro.expand(__ENV__)
+    |> Macro.to_string()
+  end
+end
+
+IO.inspect({MacroExpandReceiverRepro.Run.compiled(), MacroExpandReceiverRepro.Run.expanded_string()})
+# Expected both paths to expand the root macro call, but current output is:
+# {{:expanded, :ok}, "MacroExpandReceiverRepro.M.receiver().foo()"}
+```
+
+This is a semantic mismatch for valid macro code: the compiler expands the call and runs `N.foo/0`, while the public root-expansion API leaves the same root expression unchanged because it reports no progress after expanding only the receiver internally.
+
+## Literal-left size comparisons refine the argument as if the comparison were inverted - FIXED
+
+Source: `lib/elixir/lib/module/types/apply.ex:718-731`, `lib/elixir/lib/module/types/apply.ex:777-780`
+
+The type checker recognizes guard comparisons such as `length(x) >= 0`, `map_size(x) >= 0`, and `tuple_size(x) >= 0` and refines `x` based on the comparison. For the literal-left form, `sized_order/4` calls `invert_order/1` before passing the operator to `expected_order/3`. However, the left-literal comparison `0 <= length(x)` is equivalent to `length(x) >= 0`, while `invert_order(:"=<")` returns `:>`. The checker therefore refines the argument as non-empty even though zero-size values satisfy the guard.
+
+Minimal reproducer:
+
+```elixir
+defmodule SizeOrderRepro do
+  def list_case(x) when is_list(x) and 0 <= length(x) do
+    case x do
+      [] -> :empty
+      [_ | _] -> :non_empty
+    end
+  end
+
+  def map_case(x) when is_map(x) and 0 <= map_size(x) do
+    if x == %{}, do: :empty, else: :non_empty
+  end
+
+  def tuple_case(x) when is_tuple(x) and 0 <= tuple_size(x) do
+    case x do
+      {} -> :empty
+      _ -> :non_empty
+    end
+  end
+end
+
+IO.inspect({SizeOrderRepro.list_case([]), SizeOrderRepro.map_case(%{}), SizeOrderRepro.tuple_case({})})
+# Runtime output is correct:
+# {:empty, :empty, :empty}
+# But the type checker currently warns that the [], %{}, and {} branches are unreachable.
+```
+
+The warnings are false positives on valid guards. They can hide real exhaustiveness information because the analyzer treats `0 <= length(x)` as if it proved a non-empty list, `0 <= map_size(x)` as a non-empty map, and `0 <= tuple_size(x)` as a non-empty tuple.
+
+## Low confidence: path macros treat accessor functions such as Access.all/0 as ordinary keys - claude is convinced it's a bug
+
+Source: `lib/elixir/lib/kernel.ex:2930-2934`, `lib/elixir/lib/kernel.ex:3076-3086`, `lib/elixir/lib/kernel.ex:3188-3190`, `lib/elixir/lib/kernel.ex:3393-3401`, `lib/elixir/lib/kernel.ex:3447-3449`
+
+The list-based APIs (`get_in/2`, `put_in/3`, `update_in/3`, and `get_and_update_in/3`) explicitly treat function keys as custom accessors. The path macros extract `foo[bar]` segments through `unnest/4`, but then lower them to direct `Access.get/2` or `Access.get_and_update/3` calls. If `bar` evaluates to an accessor function such as `Access.all/0`, the macro-generated code passes that function as an ordinary Access key instead of invoking it as a traversal function.
+
+Minimal reproducer:
+
+```elixir
+defmodule PathMacroAccessRepro do
+  def run do
+    users = [%{age: 1}, %{age: 2}]
+
+    IO.inspect(get_in(users, [Access.all(), :age]))
+
+    try do
+      IO.inspect(get_in(users[Access.all()].age))
+    rescue
+      e -> IO.inspect({e.__struct__, Exception.message(e)})
+    end
+
+    IO.inspect(put_in(users, [Access.all(), :age], 0))
+
+    try do
+      IO.inspect(put_in(users[Access.all()].age, 0))
+    rescue
+      e -> IO.inspect({e.__struct__, Exception.message(e)})
+    end
+  end
+end
+
+PathMacroAccessRepro.run()
+# Current output:
+# [1, 2]
+# {ArgumentError, "the Access module supports only keyword lists (with atom keys), got: #Function<.../3 in Access.all>\n\nIf you want to search lists of tuples, use List.keyfind/3"}
+# [%{age: 0}, %{age: 0}]
+# {ArgumentError, "the Access module supports only keyword lists (with atom keys), got: #Function<.../3 in Access.all>"}
+```
+
+This is low confidence because the docs clearly guarantee custom accessor functions for the list-based APIs, while the newer path macro docs describe path extraction more narrowly. If the path macros are intended to be equivalent to the corresponding list-based calls for `foo[bar]` segments, then this is a semantic mismatch; if path macros intentionally exclude function accessors, then the current behavior is likely documentation/expectation ambiguity instead.
+
+## defimpl warns for a target module defined later in the same valid source - NOT A BUG
+
+Source: `lib/elixir/lib/protocol.ex:1195-1203`
+
+`Protocol.__impl__!/3` warns when the `for:` module is not currently compiled, unless it is built-in, `Any`, the current module, or already in `env.context_modules`. This produces a false warning when a protocol implementation appears before the target module in the same valid compilation unit. The implementation module is still generated and dispatch works after the later module definition is compiled.
+
+Minimal reproducer:
+
+```elixir
+code = """
+defprotocol PForward do
+  def f(x)
+end
+
+defimpl PForward, for: LaterForward do
+  def f(_), do: :ok
+end
+
+defmodule LaterForward do
+  defstruct []
+end
+"""
+
+{_result, diagnostics} = Code.with_diagnostics(fn -> Code.compile_string(code) end)
+IO.inspect(diagnostics)
+IO.inspect(PForward.f(struct(LaterForward)))
+# Current diagnostics include:
+# "you are implementing a protocol for LaterForward but said module is not available..."
+# But dispatch works and prints:
+# :ok
+```
+
+This is a valid-code false warning: forward module references are accepted elsewhere in Elixir compilation, and the protocol implementation is semantically usable once the target module in the same source has been defined.
+
+## Deprecated protocol defaults emit an extra misleading implementation warning - NOT A BUG/LOW PRIORITY
+
+Source: `lib/elixir/lib/protocol.ex:290-314`, `lib/elixir/lib/protocol.ex:870-883`
+
+`Protocol.def/1` accepts default arguments for now and warns that they are deprecated. It then emits a fake user signature with `Kernel.def name(args)` and the actual dispatch implementation. With defaults, the fake signature generates a default-argument wrapper such as `f/1`. Later, `__before_compile__/1` compares all definitions against the protocol function list and warns that the generated wrapper is an implementation inside the protocol, even though the user only wrote a deprecated-but-still-valid protocol function declaration.
+
+Minimal reproducer:
+
+```elixir
+defprotocol PDefaultBug do
+  @fallback_to_any true
+  def f(x, y \\ 1)
+end
+
+defimpl PDefaultBug, for: Any do
+  def f(x, y), do: {x, y}
+end
+
+IO.inspect(PDefaultBug.f(:a))
+IO.inspect(PDefaultBug.f(:a, 2))
+# Current warnings include the expected deprecation plus the misleading warning:
+# "protocols can only define functions without implementation via def/1, found: f/1"
+# Runtime output is:
+# {:a, 1}
+# {:a, 2}
+```
+
+The second warning is a false diagnostic caused by compiler-generated default-argument plumbing, not by a user-defined implementation inside the protocol.
+
+## Path.safe_relative/2 accepts chardata paths but passes chardata relative_to through unnormalized - NOT A BUG
+
+Source: `lib/elixir/lib/path.ex:914-920`
+
+The `Path` module documents that its functions accept `t:IO.chardata/0`, and `safe_relative/2` is specified as `@spec safe_relative(t, t)`. The implementation normalizes only `path` with `IO.chardata_to_string/1`, then passes `relative_to` directly to `:filelib.safe_relative_path/2`. Nested chardata that is valid for other `Path` APIs can therefore crash inside Erlang's filename code instead of behaving like the equivalent binary or charlist path.
+
+Minimal reproducer:
+
+```elixir
+for relative_to <- [".", ~c".", ["."], [~c"."]] do
+  try do
+    IO.inspect({relative_to, Path.safe_relative("foo/bar", relative_to)})
+  rescue
+    e -> IO.inspect({relative_to, e.__struct__, Exception.message(e)})
+  end
+end
+# Current output:
+# {".", {:ok, "foo/bar"}}
+# {~c".", {:ok, "foo/bar"}}
+# {["."], FunctionClauseError, "no function clause matching in :filename.join1/4"}
+# {[~c"."], {:ok, "foo/bar"}}
+```
+
+`["."]` is valid chardata and should be normalized like the first argument before calling the lower-level Erlang API. The current behavior violates the public `Path.t()` contract for `relative_to`.
+
+## Nonzero size inequality refines length/map_size to empty only - FIXED
+
+Source: `lib/elixir/lib/module/types/apply.ex:569-619`
+
+The type checker has special handling for literal comparisons involving `length/1`, `map_size/1`, and `tuple_size/1`. For `length(x) != n` and `map_size(x) != n` with `n > 0`, the branch at `custom_compare/9` refines `x` to only the empty list/map. That is an under-approximation: `length(x) != 1` also includes lists of length at least 2, and `map_size(x) != 1` also includes maps with at least 2 keys. This produces false warnings for valid guards and bodies.
+
+Minimal reproducer:
+
+```elixir
+defmodule SizeInequalityRepro do
+  def list_case(x) when is_list(x) and length(x) != 1 and x != [] do
+    hd(x)
+  end
+
+  def map_case(x) when is_map(x) and map_size(x) != 1 and is_map_key(x, :a) and is_map_key(x, :b) do
+    :ok
+  end
+
+  def tuple_case(x) when is_tuple(x) and tuple_size(x) != 1 and tuple_size(x) != 0 do
+    :ok
+  end
+end
+
+IO.inspect({SizeInequalityRepro.list_case([1, 2]), SizeInequalityRepro.map_case(%{a: 1, b: 2})})
+# Runtime output is correct:
+# {1, :ok}
+# But the type checker currently warns as if length(x) != 1 proved x == []
+# and map_size(x) != 1 proved x == %{}.
+```
+
+The warnings are false positives on valid code. The analyzer treats a nonzero inequality as the zero-size case instead of preserving the possible larger sizes.
+
+## Type checker still checks unreachable case/if branch bodies - WONT FIX
+
+Source: `lib/elixir/lib/module/types/expr.ex:340-403`, `lib/elixir/lib/module/types/expr.ex:864-881`
+
+`of_clauses_fun/8` computes pattern/guard reachability for each clause, but it invokes the body checker unconditionally. For `case` expressions, including `if` after macro expansion, that means a statically unreachable branch body can emit type warnings even though the branch cannot run. The runtime behavior is correct, but the type checker reports impossible errors from dead code.
+
+Minimal reproducer:
+
+```elixir
+Code.compile_string("""
+defmodule DeadCaseFetch do
+  def f do
+    case :ok do
+      :error -> Map.fetch!(%{}, :x)
+      :ok -> :ok
+    end
+  end
+end
+
+defmodule DeadIfFetch do
+  def f do
+    if false do
+      Map.fetch!(%{}, :x)
+    else
+      :ok
+    end
+  end
+end
+""")
+
+IO.inspect({DeadCaseFetch.f(), DeadIfFetch.f()})
+# Runtime output is correct:
+# {:ok, :ok}
+# But the type checker currently warns that both dead Map.fetch!/2 calls will always raise.
+```
+
+Both warnings are false positives on valid code. The branch selection is statically known, so diagnostics from unreachable branch bodies should be suppressed or scoped after reachability is known.
+
+## cond checks bodies of clauses whose condition is statically false - WONT FIX
+
+Source: `lib/elixir/lib/module/types/expr.ex:290-319`
+
+`cond` has a separate checker from `case`. It detects always-false conditions and emits a clause warning, but then still checks the body and unions its type into the result. This causes additional false warnings from code that cannot execute.
+
+Minimal reproducer:
+
+```elixir
+Code.compile_string("""
+defmodule DeadCond do
+  def f do
+    cond do
+      false -> Map.fetch!(%{}, :x)
+      true -> :ok
+    end
+  end
+end
+""")
+
+IO.inspect(DeadCond.f())
+# Runtime output is correct:
+# :ok
+# Current warnings include the expected unreachable-cond-clause warning plus
+# a false warning that the dead Map.fetch!/2 call will always raise.
+```
+
+The unreachable-clause warning itself is useful, but the body warning is not: the branch is guarded by literal `false` and cannot run in valid code.
+
+## Negated atom sets render as invalid unary not AST in type diagnostics - not a bug?
+
+Source: `lib/elixir/lib/module/types/descr.ex:1269-1290`
+
+`atom_to_quoted({:negation, atoms})` converts the excluded atoms to a list and then wraps that list directly as the arguments of a unary `not` node. When the excluded atom set has multiple rendered entries, such as `boolean()` plus `:foo`, this creates invalid AST shaped like `not(boolean(), :foo)`. User-facing diagnostics then print syntactically misleading type expressions.
+
+Minimal reproducer:
+
+```elixir
+Code.compile_string("""
+defmodule AtomNegDiagRepro do
+  def f(x) when is_atom(x) and x not in [true, false, :foo] do
+    Integer.to_string(x)
+  end
+end
+""")
+# Current warning includes:
+# given types:
+#
+#     -dynamic(atom() and not(boolean(), :foo))-
+```
+
+`not/1` is unary, so `not(boolean(), :foo)` is not a valid type expression. The underlying refinement may be useful, but the quoted representation should combine the excluded atoms before negating them or emit separate negations.
