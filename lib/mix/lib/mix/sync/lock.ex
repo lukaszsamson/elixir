@@ -176,7 +176,7 @@ defmodule Mix.Sync.Lock do
 
     switch_file_create!(port_path, encode_lock_info(port, os_pid))
 
-    case grab_lock(path, port_path, 0) do
+    case grab_lock(path, port_path, port, 0) do
       {:ok, 0} ->
         # We grabbed lock_0, so all good
         %{socket: socket, path: path}
@@ -197,7 +197,7 @@ defmodule Mix.Sync.Lock do
     end
   end
 
-  defp grab_lock(path, port_path, n) do
+  defp grab_lock(path, port_path, own_port, n) do
     lock_path = Path.join(path, "lock_#{n}")
 
     case File.ln(port_path, lock_path) do
@@ -205,12 +205,12 @@ defmodule Mix.Sync.Lock do
         {:ok, n}
 
       {:error, :eexist} ->
-        case probe(lock_path) do
+        case probe(lock_path, own_port) do
           {:ok, probe_socket, os_pid} ->
             {:taken, probe_socket, os_pid}
 
           {:error, _reason} ->
-            grab_lock(path, port_path, n + 1)
+            grab_lock(path, port_path, own_port, n + 1)
         end
 
       {:error, :enoent} ->
@@ -241,20 +241,35 @@ defmodule Mix.Sync.Lock do
     end
   end
 
-  defp probe(port_path) do
-    with {:ok, port, os_pid} <- fetch_probe_port(port_path),
+  defp probe(port_path, own_port) do
+    with {:ok, port, os_pid} <- fetch_probe_port(port_path, own_port),
          {:ok, socket} <- connect(port),
          {:ok, socket} <- await_probe_data(socket) do
       {:ok, socket, os_pid}
     end
   end
 
-  defp fetch_probe_port(port_path) do
+  @doc false
+  def fetch_probe_port(port_path, own_port) do
     case switch_file_read(port_path) do
       {:ok, data} ->
         case decode_lock_info(data) do
-          {0, _os_pid} -> {:error, :ignore}
-          {port, os_pid} -> {:ok, port, os_pid}
+          {0, _os_pid} ->
+            {:error, :ignore}
+
+          # A lock file naming our own listening port must be a stale
+          # leftover, for example from an interrupted take_over/3 followed
+          # by the OS recycling the port. No other live process can own the
+          # port we are listening on, so connecting would mean connecting
+          # to ourselves and waiting on our own socket forever.
+          {^own_port, _os_pid} ->
+            {:error, :own_port}
+
+          {port, os_pid} ->
+            {:ok, port, os_pid}
+
+          :error ->
+            {:error, :invalid}
         end
 
       {:error, reason} ->
@@ -352,7 +367,8 @@ defmodule Mix.Sync.Lock do
     :gen_tcp.close(lock.socket)
   end
 
-  defp encode_lock_info(port, os_pid) do
+  @doc false
+  def encode_lock_info(port, os_pid) do
     os_pid_size = byte_size(os_pid)
 
     if os_pid_size > 32 do
@@ -372,15 +388,28 @@ defmodule Mix.Sync.Lock do
     >>
   end
 
-  defp decode_lock_info(data) do
-    <<
-      port::unsigned-integer-32,
-      padding_size::unsigned-integer-8,
-      _padding::binary-size(padding_size),
-      os_pid::binary
-    >> = data
+  # Valid encoded lock info always has a fixed size: 4 bytes of port,
+  # 1 byte of padding size and 32 bytes of padding plus PID, 37 in total.
+  # The guard rejects shorter or longer content that happens to match the
+  # variable-sized binary pattern, so we never probe a port decoded from
+  # a file of the wrong size.
+  @doc false
+  def decode_lock_info(data) do
+    case data do
+      <<
+        port::unsigned-integer-32,
+        padding_size::unsigned-integer-8,
+        _padding::binary-size(padding_size),
+        os_pid::binary
+      >>
+      when padding_size + byte_size(os_pid) == 32 ->
+        {port, os_pid}
 
-    {port, os_pid}
+      # Malformed content (e.g. from an interrupted writer or an older
+      # version). Treat as stale rather than crashing the caller.
+      _ ->
+        :error
+    end
   end
 
   # We need a mechanism to atomically replace file content. Typically,
@@ -401,7 +430,35 @@ defmodule Mix.Sync.Lock do
   # at a time.
   #
   # [1]: https://github.com/elixir-lang/elixir/pull/14793#issuecomment-3338665065
-  defp switch_file_create!(path, content) do
+  @doc false
+  def switch_file_create!(path, content) do
+    # We must never open this path with truncation if it may already exist,
+    # because it can be hard-linked into lock_0. The lock protocol links a
+    # process's port_P file at lock_0 (see grab_lock/4) and, on unlock,
+    # deliberately leaves both names in place (see the note above unlock/1).
+    # When the operating system later recycles the ephemeral port P, a new
+    # process computes the same "port_P" name that the stale file still holds.
+    # Opening it with :write would O_TRUNC the shared inode, momentarily
+    # emptying lock_0 and then overwriting it with this process's own port -
+    # which corrupts concurrent readers, poisons the lock for future callers
+    # if we die mid-write, and (since we then read our own port back) makes us
+    # connect to ourselves and deadlock.
+    #
+    # Unlinking the name first guarantees we always write to a fresh inode.
+    # Removing the name never affects lock_0: it only drops the extra hard
+    # link, leaving lock_0 pointing at the original inode with its content
+    # intact. The port_P name is effectively owned by whoever currently holds
+    # the TCP port P, and that is us, so there is no concurrent writer to race.
+    #
+    # We must not ignore a removal failure: if the stale name could not be
+    # unlinked, File.write! below would open and O_TRUNC the existing inode -
+    # exactly the corruption we are preventing - so we fail loudly instead.
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> raise File.Error, reason: reason, action: "remove file", path: path
+    end
+
     data = <<0, content::binary, content::binary>>
     File.write!(path, data, [:raw])
   end
@@ -410,50 +467,74 @@ defmodule Mix.Sync.Lock do
     file = File.open!(path, [:read, :write, :binary, :raw])
 
     content_size = byte_size(new_content)
-
-    <<switch_byte>> = read_bytes!(file, 1)
+    expected_size = 1 + 2 * content_size
 
     try do
-      inactive_content_position =
-        case switch_byte do
-          0 -> 1 + content_size
-          1 -> 1
+      switch_byte =
+        case :file.read(file, 1) do
+          {:ok, <<byte>>} when byte in [0, 1] -> byte
+          _ -> nil
         end
 
-      # Write new data
-      file_pwrite!(file, inactive_content_position, new_content)
+      file_size =
+        case :file.position(file, :eof) do
+          {:ok, size} -> size
+          _ -> nil
+        end
 
-      # Toggle switch byte - it's a single byte so the content changes
-      # atomically
-      file_pwrite!(file, 0, <<1 - switch_byte>>)
+      if switch_byte != nil and file_size == expected_size do
+        # A well-formed switch-file: stage the new content in the inactive
+        # segment, then flip the single switch byte. Toggling one byte is the
+        # atomic replace (see the note above this section).
+        inactive_content_position =
+          case switch_byte do
+            0 -> 1 + content_size
+            1 -> 1
+          end
+
+        file_pwrite!(file, inactive_content_position, new_content)
+        file_pwrite!(file, 0, <<1 - switch_byte>>)
+      else
+        # The file is empty, truncated, or otherwise malformed (an interrupted
+        # writer, or a file from an older version). There is no valid inactive
+        # segment to stage into, so the atomic toggle cannot be used. We own
+        # the lock, either directly or through the chained takeover, so we
+        # repair the file IN PLACE through this descriptor.
+        #
+        # We deliberately do NOT unlink and recreate it: removing lock_0 would
+        # let a concurrent contender link its own port file at the now-free
+        # name and consider the lock acquired (the removal race the chained
+        # protocol is designed to avoid). Rewriting the whole switch-file in
+        # place, and truncating to its exact size, cannot corrupt a well-formed
+        # file - it only runs when the file is already malformed, a state
+        # readers already treat as stale.
+        file_pwrite!(file, 0, <<0, new_content::binary, new_content::binary>>)
+        {:ok, _} = :file.position(file, expected_size)
+        :ok = :file.truncate(file)
+      end
     after
       File.close(file)
     end
   end
 
-  defp switch_file_read(path) do
+  @doc false
+  def switch_file_read(path) do
     with {:ok, data} <- File.read(path) do
-      <<switch_byte, rest::binary>> = data
-      content_size = rest |> byte_size() |> div(2)
-      <<content1::binary-size(^content_size), content2::binary-size(^content_size)>> = rest
+      case data do
+        <<switch_byte, rest::binary>>
+        when switch_byte in [0, 1] and byte_size(rest) > 0 and rem(byte_size(rest), 2) == 0 ->
+          content_size = div(byte_size(rest), 2)
+          <<content1::binary-size(^content_size), content2::binary-size(^content_size)>> = rest
+          content = if switch_byte == 0, do: content1, else: content2
+          {:ok, content}
 
-      case switch_byte do
-        0 -> {:ok, content1}
-        1 -> {:ok, content2}
+        # Empty or otherwise malformed switch-file. This can happen if a writer
+        # was interrupted mid-write (leaving 0 bytes) or the file predates this
+        # version. Report it as invalid so callers treat the lock as stale and
+        # take it over, instead of raising a MatchError.
+        _ ->
+          {:error, :invalid}
       end
-    end
-  end
-
-  defp read_bytes!(file, bytes) do
-    case :file.read(file, bytes) do
-      {:ok, data} ->
-        data
-
-      :eof ->
-        raise "unexpected EOF of file when reading file"
-
-      {:error, reason} ->
-        raise File.Error, reason: reason, action: "read file"
     end
   end
 
