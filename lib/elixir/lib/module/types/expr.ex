@@ -62,6 +62,9 @@ defmodule Module.Types.Expr do
     do: {atom([atom]), context}
 
   # 12
+  def of_expr(literal, _expected, _expr, %{numberize: true}, context) when is_number(literal),
+    do: {number(), context}
+
   def of_expr(literal, _expected, _expr, _stack, context) when is_integer(literal),
     do: {integer(), context}
 

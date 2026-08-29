@@ -444,7 +444,9 @@ defmodule Module.Types.Of do
   end
 
   defp map_key_type(key, stack, context, of_fun) do
-    {key_type, context} = of_fun.(key, term(), stack, context)
+    # Map keys are compared exactly by `==`, they do not coerce numbers,
+    # so number literals in key position must keep their exact type
+    {key_type, context} = of_fun.(key, term(), %{stack | numberize: false}, context)
     domain_keys = to_domain_keys(key_type)
 
     pos_neg_domain =
@@ -561,6 +563,12 @@ defmodule Module.Types.Of do
   In the stack, we add nodes such as <<expr>>, <<..., expr>>, etc,
   based on the position of the expression within the binary.
   """
+  def bitstring(args, kind, %{numberize: true} = stack, context) do
+    # Bitstrings are compared bit by bit, `==` does not coerce numbers inside
+    # them, and segment values must remain subtypes of their specifier
+    bitstring(args, kind, %{stack | numberize: false}, context)
+  end
+
   def bitstring([], _kind, _stack, context) do
     {binary(), context}
   end

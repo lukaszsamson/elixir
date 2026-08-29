@@ -2137,6 +2137,54 @@ defmodule Module.Types.ExprTest do
                ":ne or {:eq, %{integer() => float()} and not empty_map()}"
     end
 
+    test "narrowing against a comparison literal widens its nested numbers" do
+      # `==` coerces numbers nested at any depth, `{1, :a} == {1.0, :a}`,
+      # so both branches of `w` must survive the narrowing
+      assert typecheck!(
+               [q],
+               (
+                 w = if q, do: {1, :a}, else: {1.5, :a}
+
+                 case w do
+                   x when x == {1.0, :a} -> {:eq, x}
+                   _ -> :ne
+                 end
+               )
+             )
+             |> to_quoted_string() ==
+               ":ne or {:eq, {float() or integer(), :a}}"
+    end
+
+    test "map keys keep their exact type when narrowing against a map literal" do
+      # Map keys are compared exactly by `==`: `%{1.0 => 1} == %{1 => 1.0}` is
+      # false, so only the integer-keyed map survives the narrowing
+      assert typecheck!(
+               [q],
+               (
+                 w = if q, do: %{1 => 1}, else: %{1.0 => 1}
+
+                 case w do
+                   x when x == %{1 => 1.0} and map_size(x) == 1 -> {:eq, x}
+                   _ -> :ne
+                 end
+               )
+             )
+             |> to_quoted_string() ==
+               ":ne or {:eq, %{integer() => integer()} and not empty_map()}"
+    end
+
+    test "bitstring literals in comparisons keep exact segment types" do
+      # Numbers inside bitstring segments do not coerce and must stay
+      # subtypes of their specifier
+      assert typecheck!(
+               [x],
+               case x do
+                 y when y == <<1>> -> y
+                 _ -> :other
+               end
+             ) == opt_union(dynamic(opt_union(binary(), atom([:other]))), atom([:other]))
+    end
+
     test "consider external variables as not precise" do
       assert typecheck!(
                [x],

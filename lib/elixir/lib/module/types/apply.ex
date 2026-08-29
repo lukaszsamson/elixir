@@ -829,14 +829,22 @@ defmodule Module.Types.Apply do
           skip_check? = not polarity
           return_compare(name, arg_type, type, result, skip_check?, expr, stack, context)
         else
-          expected =
+          {expected, context} =
             cond do
               # We are checking for `not x == 1` or similar, we can't say anything about x
-              polarity == false -> term()
-              # We are checking for `x == 1`, make sure x is integer or float
-              name in [:==, :"/="] -> numberize(type)
+              polarity == false ->
+                {term(), context}
+
+              # We are checking for `x == 1`, which coerces numbers nested at
+              # any depth, so we type the literal again with the numberize flag
+              # set, interpreting integer and float literals as number().
+              # The precisely typed literal is still used for diagnostics below.
+              name in [:==, :"/="] ->
+                of_fun.(literal, term(), expr, %{stack | numberize: true}, context)
+
               # Otherwise we have the literal type as is
-              true -> type
+              true ->
+                {type, context}
             end
 
           {arg_type, context} = of_fun.(arg, expected, expr, stack, context)

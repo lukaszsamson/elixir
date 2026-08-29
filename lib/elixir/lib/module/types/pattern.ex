@@ -1104,6 +1104,11 @@ defmodule Module.Types.Pattern do
   end
 
   # 12
+  def of_guard(literal, _expected, _expr, %{numberize: true}, context)
+      when is_number(literal) do
+    {number(), context}
+  end
+
   def of_guard(literal, _expected, _expr, _stack, context) when is_integer(literal) do
     {integer(), context}
   end

@@ -672,6 +672,11 @@ defmodule Module.Types do
       mode: mode,
       # The function for handling local calls
       local_handler: handler,
+      # When true, integer and float literals are typed as number().
+      # Enabled while typing the literal operand of ==//=, which coerce
+      # numbers nested at any depth. Map keys and bitstring segments do
+      # not coerce, so they disable it back.
+      numberize: false,
       # Reverse arrow handling (nil | :cache | :except_none | :include_none)
       reverse_arrow: nil
     }

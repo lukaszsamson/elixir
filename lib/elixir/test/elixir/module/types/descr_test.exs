@@ -18,7 +18,6 @@ defmodule Module.Types.DescrTest do
   doctest Module.Types.Descr, import: true
   defmacro domain_key(arg) when is_atom(arg), do: [arg]
 
-  defp number(), do: opt_union(integer(), float())
   defp empty_tuple(), do: tuple([])
   defp tuple_of_size_at_least(n) when is_integer(n), do: open_tuple(List.duplicate(term(), n))
   defp tuple_of_size(n) when is_integer(n) and n >= 0, do: tuple(List.duplicate(term(), n))

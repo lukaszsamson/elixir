@@ -105,6 +105,7 @@ defmodule Module.Types.Descr do
   def empty_map(), do: %{map: @map_empty}
   def integer(), do: %{bitmap: @bit_integer}
   def float(), do: %{bitmap: @bit_float}
+  def number(), do: %{bitmap: @bit_number}
   def list(type), do: list_descr(type, @empty_list, true)
   def non_empty_list(type, tail \\ @empty_list), do: list_descr(type, tail, false)
   def open_map(), do: %{map: @map_top}
