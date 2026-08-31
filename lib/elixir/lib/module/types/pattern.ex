@@ -521,8 +521,20 @@ defmodule Module.Types.Pattern do
       singleton?(type) -> if polarity, do: type, else: Module.Types.Descr.opt_negation(type)
       # We are checking for `not x == 1` or similar, we can't say anything about x
       polarity == false -> term()
-      # We are checking for `x == 1`, make sure x is integer or float
-      name in [:==, :"/="] -> numberize(type)
+      # We are checking for `x == 1`: re-type the operand with the numberize
+      # flag set, instead of applying numberize/1 to the resulting descriptor.
+      #
+      # NOTE: this does not work. This branch is only reached when the operand
+      # is not a quoted literal (see the `with` in `of_remote`), so `of_guard`
+      # reads an already-assembled descriptor (e.g. from a variable) and the
+      # flag, which acts at literal construction, cannot widen it. Two tests
+      # fail, reintroducing the false positives from GH-15799 (1) and (2):
+      #
+      #   * "does not discard equal values when narrowing against negated types"
+      #   * "does not discard equal values when narrowing against domain keys"
+      name in [:==, :"/="] ->
+        {type, _context} = of_guard(guard, term(), expr, %{stack | numberize: true}, context)
+        type
       # Otherwise we have the literal type as is
       true -> type
     end
